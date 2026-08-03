@@ -211,13 +211,22 @@ def emit_from_analyze(out, rows, title):
 
     present = [r for r in ORDER if any(r in x["reasons"] for x in rows)]
     rule()
-    p("5. STALL REASON x INSTRUCTION")
+    p("4. STALL REASON x INSTRUCTION")
     rule()
     p("")
-    p(f"  {'INSTRUCTION':<26} " + " ".join(f"{ABBR[r]:>13}" for r in present) + f" {'TOTAL':>9}")
-    p("  " + "-" * (28 + 14 * len(present) + 10))
-    for k, (_, _, ss, rc) in sorted(agg.items(), key=lambda kv: -kv[1][2])[:18]:
-        p(f"  {k[:26]:<26} " + " ".join(f"{rc[r]:13d}" for r in present) + f" {ss:9d}")
+    p("  Cells are 'count (pct)', where pct is of TOTAL_CNT -- that instruction's")
+    p("  total samples. So it reads as: of everything this opcode did, this share")
+    p("  was spent stalled for this reason.")
+    p("")
+    p(f"  {'INSTRUCTION':<26} " + " ".join(f"{ABBR[r]:>15}" for r in present)
+      + f" {'TOTAL':>8} {'TOTAL_CNT':>10}")
+    p("  " + "-" * (28 + 16 * len(present) + 20))
+    for k, (tc, _, ss, rc) in sorted(agg.items(), key=lambda kv: -kv[1][2])[:18]:
+        cells = " ".join(
+            (f"{rc[r]:6d}({100*rc[r]/tc:4.1f}%)" if rc[r] else f"{'-':>13}").rjust(15)
+            for r in present
+        )
+        p(f"  {k[:26]:<26} {cells} {ss:8d} {tc:10d}")
     p("")
 
     rule()
@@ -373,14 +382,23 @@ def emit(out, rows, decoded, mine, dispatches, title, ktrace=None):
     p("5. STALL REASON x INSTRUCTION")
     rule()
     p("")
-    p(f"  {'INSTRUCTION':<26} " + " ".join(f"{ABBR[r]:>13}" for r in present) + f" {'TOTAL':>9}")
-    p("  " + "-" * (28 + 14 * len(present) + 10))
+    p("  Cells are 'count (pct)', where pct is of TOTAL_CNT -- that instruction's")
+    p("  total samples. So it reads as: of everything this opcode did, this share")
+    p("  was spent stalled for this reason.")
+    p("")
+    p(f"  {'INSTRUCTION':<26} " + " ".join(f"{ABBR[r]:>15}" for r in present)
+      + f" {'TOTAL':>8} {'TOTAL_CNT':>10}")
+    p("  " + "-" * (28 + 16 * len(present) + 20))
     m = collections.defaultdict(collections.Counter)
     for r in stalled:
         m[opcode(r)][reason(r)] += 1
     for o, _ in byop.most_common(18):
-        cells = " ".join(f"{m[o][r]:13d}" for r in present)
-        p(f"  {o[:26]:<26} {cells} {sum(m[o].values()):9d}")
+        tc = rate[o][0]
+        cells = " ".join(
+            (f"{m[o][r]:6d}({100*m[o][r]/tc:4.1f}%)" if m[o][r] else f"{'-':>13}").rjust(15)
+            for r in present
+        )
+        p(f"  {o[:26]:<26} {cells} {sum(m[o].values()):8d} {tc:10d}")
     p("")
 
     rule()
