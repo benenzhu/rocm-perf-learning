@@ -25,30 +25,29 @@
 
 ### 1.0 先认字:那些反直觉的缩写
 
-计数器名字的前缀就是硬件单元名。但 AMD 这套命名**是 GCN 图形时代留下的**,很多名字和它在计算负载里的实际职能对不上——这是初学者最大的门槛,所以先把它们捋清楚:
+计数器名字的前缀就是硬件单元名,先把它们对应到实际职能:
 
-| 缩写 | 全称 | **实际是什么** | 为什么叫这名字 |
-|---|---|---|---|
-| **SQ** | **S**e**q**uencer | **波前调度器**。发射指令、管理 wave slot | 序列器,负责给波前排指令序列 |
-| **SPI** | **S**hader **P**ipe **I**nterpolator | **工作组管理器**。把 workgroup 分派到 CU | 图形时代做插值,现在只剩分派职能 |
-| **TA** | **T**exture **A**ddresser | **地址生成单元**。算 64 个 lane 的地址并合并 | 图形时代算纹理坐标 |
-| **TD** | **T**exture **D**ata | **数据返回单元**。把数据送回 VGPR | 同上 |
-| **TCP** | **T**exture **C**ache **P**er pipe | **vL1D**,每个 CU 的 L1 向量缓存 | 「每条流水线一个纹理缓存」 |
-| **TCC** | **T**exture **C**ache per **C**hannel | **L2 缓存**,全 XCD 共享,分 16 个 channel | 「每个通道一个纹理缓存」 |
-| **TCA** | **T**exture **C**ache **A**rbiter | L1↔L2 之间的**交叉开关** | 仲裁器 |
-| **TCR** | **T**exture **C**ache **R**equest | TCP 发往 L2 的**请求接口** | 出现在 `TCP_TCR_*` 里 |
-| **EA** | **E**fficiency **A**rbiter | **访存接口**,L2 之外通往 HBM/跨die/PCIe | 效率仲裁器 |
-| **UTCL1/2** | **U**nified **T**ranslation **C**ache | **TLB**(地址翻译缓存),L1/L2 两级 | — |
-| **CU** | **C**ompute **U**nit | 计算单元,含 4 个 SIMD | — |
-| **XCD** | e**X**ccelerator **C**omplex **D**ie | 一个计算 die。MI355X 有 8 个,每个 32 CU | — |
-| **GRBM** | **G**raphics **R**egister **B**us **M**anager | 提供**全局时基**,几乎所有百分比的分母 | — |
+| 缩写 | 全称 | **实际是什么** |
+|---|---|---|
+| **SQ** | **S**e**q**uencer | **波前调度器**。发射指令、管理 wave slot |
+| **SPI** | **S**hader **P**ipe **I**nterpolator | **工作组管理器**。把 workgroup 分派到 CU |
+| **TA** | **T**exture **A**ddresser | **地址生成单元**。算 64 个 lane 的地址并合并 |
+| **TD** | **T**exture **D**ata | **数据返回单元**。把数据送回 VGPR |
+| **TCP** | **T**exture **C**ache **P**er pipe | **vL1D**,每个 CU 的 L1 向量缓存 |
+| **TCC** | **T**exture **C**ache per **C**hannel | **L2 缓存**,全 XCD 共享,分 16 个 channel |
+| **TCA** | **T**exture **C**ache **A**rbiter | L1↔L2 之间的**交叉开关** |
+| **TCR** | **T**exture **C**ache **R**equest | TCP 发往 L2 的**请求接口**,见 `TCP_TCR_*` |
+| **EA** | **E**fficiency **A**rbiter | **访存接口**,L2 之外通往 HBM/跨die/PCIe |
+| **UTCL1/2** | **U**nified **T**ranslation **C**ache | **TLB**(地址翻译缓存),L1/L2 两级 |
+| **CU** | **C**ompute **U**nit | 计算单元,含 4 个 SIMD |
+| **XCD** | e**X**ccelerator **C**omplex **D**ie | 一个计算 die。MI355X 有 8 个,每个 32 CU |
+| **GRBM** | **G**raphics **R**egister **B**us **M**anager | 提供**全局时基**,几乎所有百分比的分母 |
 
 **几个特别容易踩的点:**
 
-- **看到 "Texture" 不要以为和纹理有关**——TA/TD/TCP/TCC 在计算负载里就是普通的访存流水线,`buffer_load` 走的正是这条路。
 - **TCP ≠ TCC**。差一个字母,一个是 CU 私有的 L1(每 CU 一个),一个是全 XCD 共享的 L2(16 channel)。**这是最常见的混淆。**
 - **SQ 不是"队列"**,是 Sequencer(调度器)。`SQ_*` 计数器测的是指令发射侧的事。
-- vL1D 这个词在文档里和 TCP 混用,指的是同一个东西(官方原话:*"Together, this complex is known as the vL1D, or Texture Cache per Pipe (TCP)"*)。
+- vL1D 和 TCP 在文档里混用,指同一个东西(官方原话:*"Together, this complex is known as the vL1D, or Texture Cache per Pipe (TCP)"*)。
 
 记住一条就够用了:**`前缀_XXX` 的前缀告诉你这个计数器在链路的哪一站**。下面这张图就是那条链路。
 
