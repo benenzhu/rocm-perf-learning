@@ -13,7 +13,7 @@
 
 **你的 load 指令发不出去。**
 
-不是数据回来得慢(那是延迟问题,看 `vmcnt`),而是指令**根本挤不进访存管线**。这两件事的症状看起来一样(波前停着不动),但**药方完全相反**:延迟问题要增加 inflight instructions,发射问题要减少请求条数。搞反了会越优化越慢。
+不是数据回来得慢(那是延迟问题,看 `vmcnt`),而是指令**根本挤不进访存管线**。这两件事的症状看起来一样(wave 停着不动),但**药方完全相反**:延迟问题要增加 inflight instructions,发射问题要减少请求条数。搞反了会越优化越慢。
 
 这篇讲怎么用三五个 PMC 在十分钟内区分这两者,并定位到具体代码行。
 
@@ -29,7 +29,7 @@
 
 | 缩写 | 全称 | **实际是什么** |
 |---|---|---|
-| **SQ** | **S**e**q**uencer | **波前调度器**。发射指令、管理 wave slot |
+| **SQ** | **S**e**q**uencer | **wavefront 调度器**。发射指令、管理 wave slot |
 | **SPI** | **S**hader **P**ipe **I**nterpolator | **工作组管理器**。把 workgroup 分派到 CU |
 | **TA** | **T**exture **A**ddresser | **地址生成单元**。算 64 个 lane 的地址并合并 |
 | **TD** | **T**exture **D**ata | **数据返回单元**。把数据送回 VGPR |
@@ -127,7 +127,7 @@
 | **发射侧** | ①②③④ | 指令**进不去** | `SQ_VMEM_TA_*_FIFO_FULL` | **减少指令数 / 减少每条的 tag 访问** |
 | **延迟侧** | ⑤⑥ | 数据**回不来** | `s_waitcnt vmcnt` 等待 | 增加 inflight instructions |
 
-**两者症状一样(波前不动),药方却相反**——发射受限要**减少**请求,延迟受限要**增加**在飞请求。搞反了会越优化越慢。
+**两者症状一样(wave 不动),药方却相反**——发射受限要**减少**请求,延迟受限要**增加**在飞请求。搞反了会越优化越慢。
 
 > **⚠️ 边界没那么干脆,这里要说清楚。**
 > 上图把 ④(UTCL1 + TCP tag)划在发射侧,是因为**它俩的停顿会反压回 SQ**:
@@ -160,7 +160,7 @@
 
 ### 1.1 ① 调度器:每周期只看一个 SIMD
 
-CU 里的调度器(scheduler)负责给所有在执行的波前发射指令。官方文档([Pipeline descriptions](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/cdna/pipeline-descriptions.html))对它的描述是:
+CU 里的调度器(scheduler)负责给所有在执行的 wave 发射指令。官方文档([Pipeline descriptions](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/cdna/pipeline-descriptions.html))对它的描述是:
 
 > On every clock cycle, the scheduler:
 > - Considers waves from **one of the SIMD units**, selected in a **round-robin** fashion
@@ -170,7 +170,7 @@ CU 里的调度器(scheduler)负责给所有在执行的波前发射指令。官
 
 三个关键点:
 
-1. **每周期只服务一个 SIMD**,四个 SIMD 轮转。所以对某个 SIMD 上的波前来说,**平均每 4 个周期才轮到一次发射机会**。
+1. **每周期只服务一个 SIMD**,四个 SIMD 轮转。所以对某个 SIMD 上的 wave 来说,**平均每 4 个周期才轮到一次发射机会**。
 2. 被选中的 SIMD 上,**每个类别最多发 1 条**。VALU 和 VMEM 属于不同类别,所以一条 MFMA 和一条 `buffer_load` **可以同一周期一起发出去**——它们不抢发射槽。
 3. 五个类别加起来,峰值 **IPC = 5**(per-SIMD per-CU)。
 
@@ -202,7 +202,7 @@ CU 里的调度器(scheduler)负责给所有在执行的波前发射指令。官
 
 三个 FIFO 分别装:指令本身(CMD)、64 个 lane 的地址(ADDR)、store 的写数据(DATA)。
 
-**任何一个满了,SQ 就发不出下一条 VMEM 指令**——哪怕波前完全就绪、哪怕调度器正好轮到它。这就是我们要测的那三个计数器,官方描述是:
+**任何一个满了,SQ 就发不出下一条 VMEM 指令**——哪怕 wave 完全就绪、哪怕调度器正好轮到它。这就是我们要测的那三个计数器,官方描述是:
 
 > `SQ_VMEM_TA_CMD_FIFO_FULL` — *"Number of cycles texture requests are stalled due to full cmd fifo in TA."*
 
@@ -215,7 +215,7 @@ CU 里的调度器(scheduler)负责给所有在执行的波前发射指令。官
 | | 什么时候发生 | 卡住谁 | 怎么测 |
 |---|---|---|---|
 | **①「让出 TA」** | TA 把地址拆完、请求交给 TCP | **后续指令发不出去** | `SQ_VMEM_TA_*_FIFO_FULL` |
-| **②「数据到位」** | 数据真的写进 VGPR / LDS | **本波前用数据时** | `s_waitcnt vmcnt` |
+| **②「数据到位」** | 数据真的写进 VGPR / LDS | **本 wave 用数据时** | `s_waitcnt vmcnt` |
 
 **①→② 之间隔着 L1/L2/HBM 的几百个周期。关键是:指令在 ① 就离开发射流水线了,不等 ②。**
 
@@ -586,7 +586,7 @@ TA 被下游反压 = TA_ADDR_STALLED_BY_TC_CYCLES / (GRBM_GUI_ACTIVE × cu_per_g
 |---|---|---|---|
 | 高 | **低** | TA 活太多 | **指令条数 / 合并度** |
 | 高 | 高 | TA 被 L1/L2/HBM 堵 | 下游 TCP → TCC → EA |
-| 低 | 低 | 不是发射问题 | 看 `vmcnt` 延迟、I-cache 缺失、波前数不足 |
+| 低 | 低 | 不是发射问题 | 看 `vmcnt` 延迟、I-cache 缺失、wave 数不足 |
 
 ---
 
@@ -913,7 +913,7 @@ grep -c "TA_ADDRESSER_STALLED_CYCLES" \
 ```
 ① SQ_VMEM_TA_CMD_FIFO_FULL / SQ_BUSY_CYCLES  ≥ 10% ?
    │
-   ├─ 否 → 不是发射问题。查 vmcnt 延迟 / I-cache 缺失 / 波前数不足
+   ├─ 否 → 不是发射问题。查 vmcnt 延迟 / I-cache 缺失 / wave 数不足
    │
    └─ 是 → ② TA_ADDR_STALLED_BY_TC_CYCLES / (GRBM_PER_XCD×CU) 高吗?
              │
