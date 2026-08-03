@@ -27,6 +27,10 @@
 被测 kernel 是**发射受限**而非延迟受限——指令挤不进访存管线,而不是数据回不来。
 两种方法独立得出同一结论。优化目标随 shape 变化:K 小时 epilogue 的 `buffer_store_short` 是主要瓶颈,K 大时 MFMA 和 G2S 的绝对量更大——但 store 的单位代价始终最高。
 
+**一个具体的可优化点**([00 §4.5](00-pc-sampling-buffer-load-issue-stall.md)):主循环每轮重算 10 条地址加法,
+而 ISA 显示这些地址是**循环不变**的(基址寄存器在循环体内 0~1 次写入,偏移是编译期常量)。
+把它们提到循环外可消除 `buffer_load` 前的 RAW 依赖——502 个 `ALU_DEP` 样本,占主循环停顿的 5.3%。
+
 | 方法 | 证据 |
 |---|---|
 | PMC | `SQ_VMEM_TA_CMD_FIFO_FULL / SQ_BUSY_CYCLES` = **27.2%**(阈值 10%),而 `TA_ADDR_STALLED_BY_TC` 仅 0.9% → TA 活太多,不是被下游堵 |
