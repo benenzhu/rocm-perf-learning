@@ -84,48 +84,6 @@ BARRIER_WAIT              等 s_barrier              → 同步开销
 
 ---
 
-## TL;DR
-
-```bash
-# 1. 采样。四个 flag 缺一不可:
-#    --pc-sampling-beta-enabled   PC sampling 目前是 beta,不加不生效
-#    --pc-sampling-method stochastic   只有它给停顿原因(host_trap 没有)
-#    --pc-sampling-interval 65536      cycles 单位下必须是 2 的幂且 >= 65536
-#    --kernel-trace                    ★ 否则无法知道样本属于哪个 kernel
-rocprofv3 --pc-sampling-beta-enabled \
-          --pc-sampling-method stochastic \
-          --pc-sampling-unit cycles --pc-sampling-interval 65536 \
-          --kernel-trace \
-          --output-format csv -d out -o pc -- ./your_app
-# 产出: out/pc_pc_sampling_stochastic.csv   样本
-#       out/pc_kernel_trace.csv             Dispatch_Id -> Kernel_Name
-
-# 2. 看采到了哪些 kernel(先做这步,能立刻看出混入了多少别人的样本)
-./pc_sampling_report.py out/pc_pc_sampling_stochastic.csv \
-    --kernel-trace out/pc_kernel_trace.csv --list
-
-# 3. 按 kernel 名过滤,生成报告
-./pc_sampling_report.py out/pc_pc_sampling_stochastic.csv \
-    --kernel-trace out/pc_kernel_trace.csv \
-    --kernel kernel_gemm -o report.txt
-```
-
-第 2 步的输出长这样,一眼能看出问题的严重程度:
-
-```
- SAMPLES   KERNEL
-    3399   kernel_gemm_0                                   ← 我们要的
-    1205   void at::native::elementwise_kernel_manual_...  ← 混入的
-    1071   void at::native::reduce_kernel<512, 1, ...      ← 混入的
-```
-
-**最容易踩的坑:`--kernel-include-regex` 不过滤 PC sampling 数据流**(§3.2 有源码依据),
-**而 PC sampling 的 csv 里又没有 `Kernel_Name` 列**——只能靠 `--kernel-trace` 把
-`Dispatch_Id` 翻译成 kernel 名。不做这一步,本案例的结论会从「发射受限 68.8%」
-变成「延迟受限 79%」——**完全相反**。
-
----
-
 ## 1. 三个工具,各回答一个问题
 
 §0 说了 ATT 和 PC Sampling 的互补关系。把 PMC 也放进来,三者的分工是这样的:
@@ -506,6 +464,52 @@ rocprofv3: ARBITER_WIN_EX_STALL = 2002/2909 = 68.8%
 >    它优先读 `src/requirements.txt`,该文件默认不存在——**放一份去掉版本号的进去即可**,
 >    不用改代码也不用降级任何已装的包:
 >    `sed -E 's/^([a-zA-Z0-9_-]+)[><=]+.*/\1/' requirements.txt > src/requirements.txt`
+
+---
+
+## 8. 速查:完整流程
+
+把前面讲的串起来,可以直接照抄:
+
+```bash
+# 1. 采样。四个 flag 缺一不可:
+#    --pc-sampling-beta-enabled   PC sampling 目前是 beta,不加不生效
+#    --pc-sampling-method stochastic   只有它给停顿原因(host_trap 没有)
+#    --pc-sampling-interval 65536      cycles 单位下必须是 2 的幂且 >= 65536
+#    --kernel-trace                    ★ 否则无法知道样本属于哪个 kernel
+rocprofv3 --pc-sampling-beta-enabled \
+          --pc-sampling-method stochastic \
+          --pc-sampling-unit cycles --pc-sampling-interval 65536 \
+          --kernel-trace \
+          --output-format csv -d out -o pc -- ./your_app
+# 产出: out/pc_pc_sampling_stochastic.csv   样本
+#       out/pc_kernel_trace.csv             Dispatch_Id -> Kernel_Name
+
+# 2. 看采到了哪些 kernel(务必先做,能立刻看出混入了多少别人的样本)
+./pc_sampling_report.py out/pc_pc_sampling_stochastic.csv \
+    --kernel-trace out/pc_kernel_trace.csv --list
+
+# 3. 按 kernel 名过滤,生成报告
+./pc_sampling_report.py out/pc_pc_sampling_stochastic.csv \
+    --kernel-trace out/pc_kernel_trace.csv \
+    --kernel kernel_gemm -o report.txt
+```
+
+第 2 步的输出长这样,一眼能看出问题的严重程度:
+
+```
+ SAMPLES   KERNEL
+    3399   kernel_gemm_0                                   ← 我们要的
+    1205   void at::native::elementwise_kernel_manual_...  ← 混入的
+    1071   void at::native::reduce_kernel<512, 1, ...      ← 混入的
+```
+
+**再强调一遍最容易踩的坑**([§3](#3--两道过滤少一道结论就反了)):
+`--kernel-include-regex` **不过滤 PC sampling 数据流**,而 PC sampling 的 csv 里
+**又没有 `Kernel_Name` 列**——只能靠 `--kernel-trace` 把 `Dispatch_Id` 翻译成 kernel 名。
+不做这一步,本案例的结论会从「发射受限 68.8%」变成「延迟受限 79%」——**完全相反**。
+
+> 用官方 `rocprof-compute analyze -k 0` 则内置了 kernel 过滤,可以跳过这一步,见 [§7](#7-另一条路官方-rocprof-compute)。
 
 ---
 
