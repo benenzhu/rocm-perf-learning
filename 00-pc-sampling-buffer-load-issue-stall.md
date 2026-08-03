@@ -5,9 +5,82 @@
 > 案例:一个真实的 MXFP4 GEMM kernel(M=N=K=8192,~4500 TFLOPS)
 > 配套:[`pc_sampling_report.py`](pc_sampling_report.py) · 报告样例 [`pc-sampling-official.txt`](pc-sampling-official.txt)
 
-**这是本系列的开篇。** 想找 kernel 的性能问题,PC Sampling 通常是最快的第一步——它直接告诉你**哪条指令在停、为什么停**,不需要先猜是哪个硬件单元。
+---
 
-想进一步搞清楚"为什么这条指令会停"、以及硬件层面的量化模型,看 [01 · 用 PMC 定位 VMEM 发射停顿](01-vmem-issue-stalls.md)。
+## 0. 为什么不用 ATT?
+
+经常在 ROCm 上写 kernel、调 kernel 的人,对 **ATT(Advanced Thread Trace)** 应该都不陌生。它能给出 GPU 硬件上**每条指令的实际执行顺序**、**每条指令 issue 了多久**,以及**哪里 stall 了**。对照着改代码、定位瓶颈,非常方便。
+
+官方文档([Thread trace](https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/latest/how-to/using-thread-trace.html))里那张表大致是这样的:
+
+| Codeobj | Vaddr | Instruction | Hitcount | **Latency** | **Stall** | **Idle** | Source |
+|---|---|---|---|---|---|---|---|
+
+- **Latency** = Stall time + Issue time(gfx9)
+- **Stall** = 硬件管线发不出指令的周期数
+- **Idle** = 上一条指令结束到这一条开始之间的空隙
+
+但最近用下来,发现它有两个绕不过去的局限。
+
+### 0.1 局限一:知道 stall 了,但不知道**为什么** stall
+
+ATT 会告诉你某条指令 stall 了多少个周期,**却不告诉你原因**。
+
+比如下图这种情况——`buffer_load` 经常卡很久,前后没有任何说明,而且是**随机**卡:
+
+<!-- TODO: 补图 1 —— ATT trace 中 buffer_load 长时间 stall 的截图 -->
+
+官方对 Stall 列的解释只有一句:
+
+> *"Usually caused when the hardware unit is busy, such as **TCP or LDS backpressure**."*
+
+"通常是下游单元忙" —— 这句话本身没错,但**到底是 TCP 满了、LDS 满了、TLB 在翻译、还是 L2 反压回来了?ATT 看不出来。** 而这几种原因的修法完全不同,甚至相反(见 [01](01-vmem-issue-stalls.md))。
+
+我们真正想知道的是:**它为什么会 stall。**
+
+### 0.2 局限二:那段空白到底是什么?
+
+第二个问题更让人困惑:代码里每隔一段(比如循环边界、跨 code object 调用),**ATT 里会出现一段空白**。
+
+<!-- TODO: 补图 2 —— ATT trace 中出现空白段的截图 -->
+
+这段空白的成因有好几种可能:
+
+- **I-cache miss** —— 取指跟不上(官方把它列在 Idle 的成因里)
+- **ATT 自身的局限** —— 它只能追踪 **每个 SE 的一个 CU**(`att-target-cu`),采样窗口有限
+- **ATT 的 overhead** —— trace 缓冲区写满、或者 trace 本身的开销
+
+之前我一直倾向于认为是 I-cache miss,但**没有办法证实**。而这三种原因,一种是真问题、两种是测量假象——搞错了就是白优化。
+
+### 0.3 这就是引入 PC Sampling 的理由
+
+**PC Sampling 恰好补上了 ATT 缺的那一块:它直接给出 `Stall_Reason`。**
+
+```
+ARBITER_WIN_EX_STALL      赢了仲裁,但执行单元不收   → 发射受限
+ARBITER_NOT_WIN           没抢到发射槽              → wave 之间竞争
+WAITCNT                   等 s_waitcnt              → 延迟问题
+NO_INSTRUCTION_AVAILABLE  取指跟不上                → I-cache 压力  ← 能验证 0.2 的猜想
+BARRIER_WAIT              等 s_barrier              → 同步开销
+```
+
+同一条 `buffer_load`,ATT 说"它 stall 了 N 个周期",PC Sampling 说"**它 stall 是因为赢了仲裁但 TA 不收**"——后者才能直接指向修法。
+
+而且 `NO_INSTRUCTION_AVAILABLE` 这个原因,正好能用来验证 §0.2 那段空白到底是不是 I-cache miss。
+
+**两者是互补的**:ATT 给时间线和顺序,PC Sampling 给原因分布。
+
+| | ATT | PC Sampling |
+|---|---|---|
+| 指令执行顺序 / 时间线 | ✅ | ❌ |
+| 每条指令 stall 多久 | ✅ | ❌(只有相对占比) |
+| **stall 的原因** | ❌ | ✅ |
+| 覆盖范围 | 每 SE 一个 CU | 全 GPU 抽样 |
+
+---
+
+**本篇讲怎么用 ROCm 的 PC Sampling。** 下一篇 [01](01-vmem-issue-stalls.md) 讲 PMC ——
+当 PC Sampling 告诉你"下游单元不收"之后,**用哪些 counter 能查出到底是从哪一级反压回来的**。
 
 ---
 
@@ -53,20 +126,38 @@ rocprofv3 --pc-sampling-beta-enabled \
 
 ---
 
-## 1. PC Sampling 能回答什么,PMC 不能
+## 1. 三个工具,各回答一个问题
 
-PMC 是**计数器**:告诉你「TA 的队列满了 27.2% 的时间」。
-PC Sampling 是**采样器**:周期性抓取每个 wave 的 PC + 状态,告诉你「**是这条 `buffer_store_short` 在停**」。
+§0 说了 ATT 和 PC Sampling 的互补关系。把 PMC 也放进来,三者的分工是这样的:
+
+| 工具 | 回答的问题 | 粒度 | 数据性质 |
+|---|---|---|---|
+| **ATT** | 指令**按什么顺序**执行、各停了多久 | 时间线 | 每 SE 一个 CU |
+| **PC Sampling** | **哪条指令**在停、**为什么**停 | 具体指令 | 全 GPU 抽样 |
+| **PMC** | **哪个硬件单元**是瓶颈、超没超阈值 | 硬件单元 | 全量计数 |
+
+一个典型的排查链条:
+
+```
+ATT          看到 buffer_load 卡了很久,但不知道为什么
+   ↓
+PC Sampling  ARBITER_WIN_EX_STALL —— 赢了仲裁但执行单元不收
+   ↓
+PMC          SQ_VMEM_TA_CMD_FIFO_FULL 27.2% —— 是 TA 的队列满了
+             TA_ADDR_STALLED_BY_TC 0.9%    —— 且 TA 不是被下游堵的
+   ↓
+结论         TA 自己活太多 → 减少 VMEM 指令数 / 提高合并度
+```
+
+**本篇走第二步**,[01](01-vmem-issue-stalls.md) 走第三步。
+
+PC Sampling 相对 PMC 的取舍(§6 有实测):
 
 | | PMC | PC Sampling |
 |---|---|---|
-| 粒度 | 硬件单元 | **具体指令** |
-| 数据 | 全量计数 | 抽样 |
+| 数据 | 全量计数,无误差 | 抽样,有置信区间 |
 | 阈值 | 有官方判据(≥10%) | 无,只有相对占比 |
 | 开销(本例) | 6.7 s | 10.7 s |
-
-**两者互补**:PMC 定方向(哪个单元),PC Sampling 定位置(哪条指令)。
-本文用 PC Sampling 定位到具体指令;[01](01-vmem-issue-stalls.md) 用 PMC 从硬件单元的角度独立验证同一结论,两者互为交叉印证。
 
 ---
 
@@ -253,10 +344,13 @@ ARBITER_NOT_WIN             5    0.2%
 
 **发射侧 68.8% vs 延迟侧 9.5%,相差 7.2 倍。**
 
-两个值得注意的数:
+三个值得注意的数:
 
 - **`WAITCNT` 只有 9.5%** —— 这个 kernel 已经把 32 条 load 堆在飞行中,延迟掩盖得很好
 - **`ARBITER_NOT_WIN` 只有 0.2%** —— wave 之间几乎没有仲裁竞争,卡的全是「抢到了却发不出去」
+- **`NO_INSTRUCTION_AVAILABLE` 只有 0.3%** —— **这回答了 §0.2 那个问题**:
+  ATT 里那些空白段,在这个 kernel 上**不是 I-cache miss**(取指几乎没有停顿),
+  更可能是 ATT 自身的采样局限。同样的方法可以用来验证你自己 kernel 里的空白段。
 
 ### 5.2 停顿落在哪些指令上
 
