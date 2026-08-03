@@ -19,6 +19,26 @@ rocprofv3 --pmc SQ_VMEM_TA_CMD_FIFO_FULL SQ_VMEM_TA_ADDR_FIFO_FULL SQ_BUSY_CYCLE
 
 > 这组刚好卡在硬件槽位上限内(SQ 用 5/8,TA 用 2/2,GRBM 用 1/2),**一趟采完不用重放**。
 
+**这些计数器分别是什么意思**(引号内为官方原文):
+
+| 计数器 | 在链路哪一站 | 数的是什么 | 怎么用 |
+|---|---|---|---|
+| `SQ_VMEM_TA_CMD_FIFO_FULL` | ①→② | *"cycles texture requests are stalled due to full **cmd** fifo in TA"*<br>SQ 想发 VMEM,但 TA 的**命令**队列满了的周期数 | **主判据**,除以 `SQ_BUSY_CYCLES` |
+| `SQ_VMEM_TA_ADDR_FIFO_FULL` | ①→② | 同上,但满的是**地址**队列(装 64 个 lane 的地址) | 佐证,通常和上面同向 |
+| `SQ_VMEM_WR_TA_DATA_FIFO_FULL` | ①→② | 同上,满的是**写数据**队列(仅 store 相关) | store 密集时才看 |
+| `SQ_BUSY_CYCLES` | ① | *"clock cycles there are active waves in a shader engine"*<br>SE 里**有 wave 存在**的周期数(不是 wave 数量) | **发射侧的分母** |
+| `SQ_INSTS_VMEM` | ① | 发射出去的 VMEM 指令**条数** | 算每条指令的平均代价 |
+| `SQ_WAIT_INST_ANY` | ① | *"wave-cycles spent waiting for **any instruction issue**"*<br>wave 想发指令但发不出去的周期(**注意单位是 quad-cycle,要 ×4**) | 「发不出去」的总量,含非 VMEM 原因 |
+| `TA_TA_BUSY` | ③ | TA 单元忙碌的周期数 | 除以 `GRBM_PER_XCD × CU` 得忙碌率 |
+| `TA_ADDR_STALLED_BY_TC_CYCLES` | ③←④ | *"cycles addr path **stalled by TC**"*<br>TA 的地址通路**被下游(L1)堵住**的周期数 | **分水岭判据**:区分"TA 活多"还是"TA 被堵" |
+| `GRBM_GUI_ACTIVE` | 全局 | GPU 活跃周期数,**全局时基** | 大部分百分比的分母(⚠️见下方坑 3) |
+
+**三个容易误解的点:**
+
+- **`FIFO_FULL` 数的是"周期",不是"次数"** —— 它是「队列满、SQ 发不出去」这个**状态持续了多少个时钟周期**,所以要除以时间(`SQ_BUSY_CYCLES`)才有意义。
+- **官方用词是 stalled 不是 waiting** —— 这是**结构冒险**(队列没位置),不是数据依赖。和 `s_waitcnt vmcnt` 是两回事。
+- **CMD / ADDR / DATA 是三个独立队列**,任何一个满都会卡住发射。装的分别是:指令本身、64 个 lane 的地址、store 的写数据。
+
 ### 第 2 步:算两个数,查表定位
 
 ```
@@ -69,11 +89,39 @@ dump ISA 数出每类指令条数,乘以各自 tag 访问数求和,**和 `TCP_TO
 | tag 冲突 | `TCP_READ_TAGCONFLICT_STALL_CYCLES / TCP_GATE_EN1` | ≥10% |
 | tag bank 热点 | `TCP_TAGRAM{0..3}_REQ` 是否均衡 | 某 bank ≫25% |
 
+这几个计数器的含义:
+
+| 计数器 | 数的是什么 |
+|---|---|
+| `TCP_TOTAL_CACHE_ACCESSES` | *"total cache line (**tag**) accesses (includes hits and misses)"*<br>**查了多少次 tag** —— 命中未命中都算,§1.5 模型的核心量 |
+| `TCP_TCR_TCP_STALL_CYCLES` | L1 发往 L2 的请求接口被**反压**的周期数 |
+| `TCP_UTCL1_STALL_INFLIGHT_MAX` | 在飞的**地址翻译**请求数打满 → TLB 容量不够 |
+| `TCP_UTCL1_STALL_LFIFO_NO_RES` | 等 UTCL2 返回翻译结果 → 页表遍历慢 |
+| `TCP_*_TAGCONFLICT_STALL_CYCLES` | 多个请求撞同一个 tag set 导致的串行化 |
+| `TCP_TAGRAM{0..3}_REQ` | 4 个 tag bank **各自**收到的请求数,看分布是否均衡 |
+| `TCP_GATE_EN1` / `EN2` | TCP 的**接口时钟** / **核心时钟**开启周期数 —— TCP 类指标的分母 |
+
+> ⚠️ **`EN1` 还是 `EN2`?AMD 自己的两个面板不一致,这个坑要知道。**
+>
+> | | 1600 vL1D 面板 | 3000 mem_bw 面板 |
+> |---|---|---|
+> | `TCP_TCR_TCP_STALL_CYCLES` | ÷ `GATE_EN1` | ÷ **`GATE_EN2`** |
+> | `TCP_*_TAGCONFLICT_*` | ÷ `GATE_EN1` | — |
+> | `TCP_UTCL1_STALL_*` | — | ÷ `GATE_EN2` |
+>
+> `EN1` 是接口时钟(总是开),`EN2` 是核心时钟(有活才开),所以
+> **`EN2 / EN1` 本身就是 TCP 利用率**(3000 面板第 95 行正是这么定义的),`EN2 ≤ EN1`。
+> 用 `EN2` 当分母得到的比例更大 —— 它衡量「TCP **干活时**有多少在停顿」,
+> 用 `EN1` 则是「**全时段**有多少在停顿」。
+>
+> **两者都不算错,但绝不能混着比。** 本文统一用 `EN1`(和 1600 面板一致),
+> 阈值 10% 也来自那套配置。换分母时记得阈值要跟着换。
+
 ### 五条保命经验
 
 1. **发射受限和延迟受限的药方相反。** 前者要**减少**请求,后者要**增加** inflight。搞反了越优化越慢。
 2. **TA 不是缓存。** `SQ_INSTS_VMEM == TA_TOTAL_WAVEFRONTS`(实测完全相等),提高命中率**不减轻 TA 负担**。
-3. **分母有坑。** `rocprofv3` 报的 `GRBM_GUI_ACTIVE` 是 8 个 XCD 求和值;TA 类要除 XCD 数,TCP 类分母是 `TCP_GATE_EN1`,UTCL1 类是 `TCP_GATE_EN2`。用错会差 16 倍。
+3. **分母有坑,而且官方自己都不统一。** `rocprofv3` 报的 `GRBM_GUI_ACTIVE` 是 8 个 XCD 求和值,TA 类要先除 XCD 数(用错差 16 倍);TCP 类的分母 AMD 两个面板一个用 `GATE_EN1` 一个用 `GATE_EN2`(见第 4 步的说明),**自己统一就好,但别混着比**。
 4. **wall-clock 异常先用 GPU 侧计数器验证。** 我曾测到一个 9 倍性能悬崖,结果是测试脚本的问题(§6 坑 1)。
 5. **传闻的坑要实测。** 本文 kernel 完全符合"512B stride"这个著名踩坑条件,实测 tag 冲突却是 **0**(§6 坑 2)。
 
