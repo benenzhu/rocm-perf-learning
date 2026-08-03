@@ -1,0 +1,195 @@
+====================================================================================================
+PC SAMPLING REPORT  --  fp4_gemm_4wave  (kernel_gemm_0)
+====================================================================================================
+GPU      : AMD Instinct MI355X (gfx950 / CDNA4)
+Kernel   : fp4_gemm_4wave   M=N=8192  K=1024   BLOCK 256x256   4 waves/workgroup
+Source   : kernels/gemm/fp4_gemm_4wave.py  (FlyDSL)
+Baseline : 242 us @ M=N=K=8192  (~4500 TFLOPS)
+
+Command  : rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
+                     --pc-sampling-unit cycles --pc-sampling-interval 65536 \
+                     --output-format csv -d out -o pc -- python3 prof_fp4.py
+
+Samples  :  9656  raw
+            7869  with decoded instruction text
+            4863  from OTHER kernels (PyTorch quant/shuffle) -- EXCLUDED
+            3006  from kernel_gemm_0  (dispatch ids 143,144,145,146)
+             -> 2232 stalled / 774 issued
+
+!! TWO FILTERS ARE REQUIRED, BOTH EASY TO MISS !!
+   (1) Drop rows with empty Instruction  (PC not resolvable to any code object).
+   (2) Keep only THIS kernel dispatch ids.  --kernel-include-regex does NOT filter
+       the PC sampling stream: samples from every kernel in the process still land
+       in the csv.  Separate by Dispatch_Id (or by an opcode unique to your kernel).
+   Skipping (2) here would report ARBITER_WIN_EX_STALL as 26% instead of the true 67%,
+   and would attribute global_load_* stalls to a kernel that contains no such op.
+
+====================================================================================================
+1. STALL REASONS   (stalled samples of kernel_gemm_0, n=2232)
+====================================================================================================
+
+  REASON                        COUNT      PCT
+  --------------------------------------------------------------------------------
+  ARBITER_WIN_EX_STALL           1488    66.7%   ###############################
+  BARRIER_WAIT                    333    14.9%   #######
+  ALU_DEPENDENCY                  208     9.3%   ####
+  WAITCNT                         189     8.5%   ####
+  NO_INSTRUCTION_AVAILABLE          9     0.4%   
+  ARBITER_NOT_WIN                   4     0.2%   
+  INTERNAL_INSTRUCTION              1     0.0%   
+
+  ARBITER_WIN_EX_STALL : won arbitration, the execution unit refused the
+                         instruction -> downstream (TA/LDS/MFMA) is full.
+                         THIS IS THE ISSUE STALL.
+  ARBITER_NOT_WIN      : lost arbitration to another wave. A different problem,
+                         and negligible here (0.2%).
+  WAITCNT              : waiting on s_waitcnt for data. Only 8.5% -- the kernel
+                         already hides memory latency well (32 loads in flight).
+
+  => Issue-side (66.7%) dominates latency-side (8.5%) by 7.9x.
+     This independently confirms the PMC result SQ_VMEM_TA_CMD_FIFO_FULL = 27.2%.
+
+====================================================================================================
+2. ARBITER_WIN_EX_STALL BY INSTRUCTION   (the issue-stall signal)
+====================================================================================================
+
+  Total: 1488 samples (66.7% of all stalls)
+
+     COUNT      PCT   INSTRUCTION
+  --------------------------------------------------------------------------------
+       813    54.6%   buffer_store_short                 #####################
+       377    25.3%   buffer_load_dwordx4                ##########
+       172    11.6%   v_mfma_scale_f32_16x16x128_f8f6f4  ####
+        62     4.2%   buffer_load_dword                  ##
+        24     1.6%   ds_read_b128                       #
+        11     0.7%   v_accvgpr_read_b32                 
+         8     0.5%   v_or_b32_e32                       
+         6     0.4%   v_cvt_pk_bf16_f32                  
+         6     0.4%   v_add_lshl_u32                     
+         4     0.3%   v_accvgpr_mov_b32                  
+         1     0.1%   v_add_u32_e32                      
+         1     0.1%   v_readfirstlane_b32                
+         1     0.1%   v_mul_lo_u32                       
+         1     0.1%   v_lshlrev_b32_e32                  
+         1     0.1%   v_lshrrev_b32_e32                  
+
+  VMEM (buffer_*/global_*/flat_*): 1252 / 1488 = 84.1%
+
+  Reading this table:
+    buffer_store_short   813 (54.6%)  epilogue, 256 per wave, each moves only 2B/lane
+    buffer_load_dwordx4  377 (25.3%)  G2S main data, direct-to-LDS, 64 per wave
+    buffer_load_dword     62 (4.2%)  scale loads, 32 per wave, 4B/lane
+
+  The store is the single largest issue stall -- consistent with its waste ratio
+  of 2.0 (4 tag accesses to move 128B, floor is 2). G2S is second by count but has
+  waste ratio 1.0, i.e. its tag traffic is irreducible.
+
+====================================================================================================
+3. ALL STALLED INSTRUCTIONS
+====================================================================================================
+
+   STALLED     PCT   INSTRUCTION
+  --------------------------------------------------------------------------------
+       954   42.7%   buffer_store_short
+       410   18.4%   buffer_load_dwordx4
+       333   14.9%   s_barrier
+       189    8.5%   s_waitcnt
+       182    8.2%   v_mfma_scale_f32_16x16x128_f8f6f4
+        62    2.8%   buffer_load_dword
+        55    2.5%   ds_read_b128
+        11    0.5%   v_accvgpr_read_b32
+         9    0.4%   v_add_lshl_u32
+         8    0.4%   v_or_b32_e32
+         6    0.3%   v_cvt_pk_bf16_f32
+         4    0.2%   v_accvgpr_mov_b32
+         2    0.1%   s_mov_b32
+         1    0.0%   v_add_u32_e32
+         1    0.0%   s_mul_i32
+         1    0.0%   v_readfirstlane_b32
+         1    0.0%   v_mul_lo_u32
+         1    0.0%   s_nop
+         1    0.0%   v_lshlrev_b32_e32
+         1    0.0%   v_lshrrev_b32_e32
+
+====================================================================================================
+4. STALL REASON x INSTRUCTION
+====================================================================================================
+
+  INSTRUCTION                   ARB_WIN_EX       BARRIER       ALU_DEP       WAITCNT NO_INST_AVAIL   ARB_NOT_WIN      INTERNAL     TOTAL
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  buffer_store_short                   813             0           139             0             2             0             0       954
+  buffer_load_dwordx4                  377             0            29             0             0             4             0       410
+  s_barrier                              0           333             0             0             0             0             0       333
+  s_waitcnt                              0             0             0           189             0             0             0       189
+  v_mfma_scale_f32_16x16x128           172             0             6             0             4             0             0       182
+  buffer_load_dword                     62             0             0             0             0             0             0        62
+  ds_read_b128                          24             0            31             0             0             0             0        55
+  v_accvgpr_read_b32                    11             0             0             0             0             0             0        11
+  v_add_lshl_u32                         6             0             0             0             3             0             0         9
+  v_or_b32_e32                           8             0             0             0             0             0             0         8
+  v_cvt_pk_bf16_f32                      6             0             0             0             0             0             0         6
+  v_accvgpr_mov_b32                      4             0             0             0             0             0             0         4
+  s_mov_b32                              0             0             2             0             0             0             0         2
+  v_add_u32_e32                          1             0             0             0             0             0             0         1
+  s_mul_i32                              0             0             1             0             0             0             0         1
+  v_readfirstlane_b32                    1             0             0             0             0             0             0         1
+  v_mul_lo_u32                           1             0             0             0             0             0             0         1
+  s_nop                                  0             0             0             0             0             0             1         1
+
+====================================================================================================
+5. INSTRUCTION TYPE MIX   (all kernel_gemm_0 samples, n=3006)
+====================================================================================================
+
+  TYPE                        COUNT      PCT
+  ----------------------------------------------
+  TEX                          1360    45.2%
+  NO_INST                       740    24.6%
+  MATRIX                        438    14.6%
+  VALU                          344    11.4%
+  SCALAR                         64     2.1%
+  LDS                            58     1.9%
+  BARRIER                         2     0.1%
+
+  TEX = vector memory (buffer/global). NO_INST rows here are decoded but the
+  sampler classified no functional unit (s_nop, exec-mask ops, etc.).
+
+====================================================================================================
+6. HOTTEST PCs   (top 30 by stalled samples)
+====================================================================================================
+
+  STALLED  DOMINANT        INSTRUCTION
+  ------------------------------------------------------------------------------------------------
+      388  ARB_WIN_EX      buffer_store_short v0, v2, s[12:15], 0 offen
+      333  BARRIER         s_barrier
+      150  ARB_WIN_EX      buffer_store_short v5, v6, s[12:15], 0 offen
+      145  ARB_WIN_EX      buffer_store_short v10, v11, s[12:15], 0 offen
+       89  WAITCNT         s_waitcnt vmcnt(0)
+       49  ARB_WIN_EX      buffer_store_short v18, v22, s[12:15], 0 offen
+       46  ARB_WIN_EX      buffer_store_short v10, v14, s[12:15], 0 offen
+       41  ARB_WIN_EX      buffer_store_short v14, v18, s[12:15], 0 offen
+       40  WAITCNT         s_waitcnt vmcnt(16)
+       35  WAITCNT         s_waitcnt vmcnt(1) lgkmcnt(7)
+       30  ARB_WIN_EX      buffer_load_dwordx4 v115, s[16:19], s2 offen lds
+       30  ARB_WIN_EX      buffer_load_dwordx4 v111, s[12:15], s47 offen lds
+       22  ARB_WIN_EX      buffer_load_dwordx4 v109, s[12:15], s47 offen lds
+       21  ARB_WIN_EX      buffer_load_dwordx4 v114, s[16:19], s23 offen lds
+       21  ARB_WIN_EX      buffer_load_dwordx4 v114, s[16:19], s2 offen lds
+       21  ARB_WIN_EX      buffer_load_dwordx4 v113, s[16:19], s2 offen lds
+       19  ARB_WIN_EX      buffer_load_dwordx4 v112, s[16:19], s2 offen lds
+       18  ARB_WIN_EX      buffer_load_dwordx4 v113, s[16:19], s29 offen lds
+       17  ARB_WIN_EX      buffer_load_dwordx4 v108, s[12:15], s47 offen lds
+       15  ARB_WIN_EX      buffer_load_dwordx4 v110, s[12:15], s47 offen lds
+       15  ARB_WIN_EX      buffer_load_dwordx4 v110, s[12:15], s22 offen lds
+       13  ARB_WIN_EX      buffer_store_short v7, v8, s[12:15], 0 offen
+       13  ARB_WIN_EX      buffer_load_dwordx4 v110, s[12:15], s2 offen lds
+       12  ARB_WIN_EX      buffer_load_dwordx4 v108, s[12:15], s22 offen lds
+       12  ARB_WIN_EX      buffer_load_dwordx4 v115, s[16:19], s23 offen lds
+       12  ARB_WIN_EX      buffer_store_short v6, v7, s[12:15], 0 offen
+       12  ARB_WIN_EX      buffer_store_short v0, v22, s[12:15], 0 offen
+       11  ARB_WIN_EX      buffer_load_dword v166, v163, s[8:11], 0 offen offset:512
+       11  ARB_WIN_EX      buffer_load_dwordx4 v108, s[12:15], s2 offen lds
+       11  ARB_WIN_EX      buffer_load_dwordx4 v109, s[12:15], s2 offen lds
+
+====================================================================================================
+END OF REPORT
+====================================================================================================
