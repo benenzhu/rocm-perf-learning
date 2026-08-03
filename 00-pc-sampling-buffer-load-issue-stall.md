@@ -119,27 +119,19 @@ PC Sampling 相对 PMC 的取舍(§6 有实测):
 
 ---
 
-## 2. 两种模式,选 stochastic
+## 2. 用 stochastic 模式
 
-| | `host_trap` | `stochastic` |
-|---|---|---|
-| 采样方式 | 软件定时中断 | **硬件采样** |
-| 单位 | 时间(µs) | **周期 / 指令** |
-| 支持 | MI200+ | MI300+ |
-| **有停顿原因吗** | ❌ **没有** | ✅ **有** |
-
-实测两种模式的输出列:
+`--pc-sampling-method` 有两个取值,**必须选 `stochastic`**(MI300+ 支持):它是硬件采样,输出里带这三列——
 
 ```
-host_trap  : Sample_Timestamp, Exec_Mask, Dispatch_Id, Instruction,
-             Instruction_Comment, Correlation_Id
-stochastic : ... + Wave_Issued_Instruction, Instruction_Type,
-             Stall_Reason, Wave_Count          ← 关键的三列
+Wave_Issued_Instruction    这次采样时,该指令发出去了没有
+Instruction_Type           VALU / TEX / MATRIX / ...
+Stall_Reason               ★ 没发出去的话,为什么          ← 全文的核心
 ```
 
-**要分析停顿必须用 `stochastic`。** `host_trap` 只能告诉你 PC 分布(哪里热),不能告诉你为什么停。
+另一个模式 `host_trap` 是软件定时中断,**输出里没有 `Stall_Reason`**,只能告诉你 PC 分布(哪里热)、给不出原因——那正是 §0 里 ATT 已经能做的事。所以本文不用它。
 
-> 采样间隔:`stochastic` + `cycles` 时必须是 2 的幂且 ≥65536。
+> **采样间隔**:`cycles` 单位下必须是 2 的幂且 ≥65536。
 > 默认 1048576 太稀疏(本例只拿到 309 个有效停顿样本);
 > **用 65536 能拿到 2909 个**,精度从 ±5.2% 提到 ±1.7%。
 
@@ -474,7 +466,7 @@ rocprofv3: ARBITER_WIN_EX_STALL = 2002/2909 = 68.8%
 ```bash
 # 1. 采样。四个 flag 缺一不可:
 #    --pc-sampling-beta-enabled   PC sampling 目前是 beta,不加不生效
-#    --pc-sampling-method stochastic   只有它给停顿原因(host_trap 没有)
+#    --pc-sampling-method stochastic   必须是 stochastic,只有它给 Stall_Reason
 #    --pc-sampling-interval 65536      cycles 单位下必须是 2 的幂且 >= 65536
 #    --kernel-trace                    ★ 否则无法知道样本属于哪个 kernel
 rocprofv3 --pc-sampling-beta-enabled \
