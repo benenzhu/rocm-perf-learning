@@ -75,7 +75,27 @@ def load(path):
     return rows
 
 
-def list_dispatches(decoded):
+def load_kernel_trace(path):
+    """Dispatch_Id -> Kernel_Name from a rocprofv3 --kernel-trace csv."""
+    m = {}
+    for r in csv.DictReader(open(path)):
+        if r.get("Kind") == "KERNEL_DISPATCH":
+            m[r["Dispatch_Id"]] = r["Kernel_Name"]
+    if not m:
+        sys.exit(f"error: no KERNEL_DISPATCH rows in {path}")
+    return m
+
+
+def list_kernels(decoded, ktrace):
+    if ktrace:
+        by = collections.Counter(ktrace.get(r["Dispatch_Id"], "<unknown dispatch>") for r in decoded)
+        print(f"{'SAMPLES':>8}   KERNEL")
+        print("-" * 96)
+        for name, n in by.most_common():
+            print(f"{n:8d}   {name[:84]}")
+        return
+    print("no --kernel-trace given; showing dispatch ids and their opcode mix instead")
+    print("(re-profile with --kernel-trace to get real kernel names)\n")
     by = collections.defaultdict(collections.Counter)
     for r in decoded:
         by[r["Dispatch_Id"]][opcode(r)] += 1
@@ -86,7 +106,7 @@ def list_dispatches(decoded):
         print(f"{d:>10} {sum(c.values()):8d}   {top[:66]}")
 
 
-def emit(out, rows, decoded, mine, dispatches, title):
+def emit(out, rows, decoded, mine, dispatches, title, ktrace=None):
     L = []
     p = L.append
 
@@ -104,7 +124,10 @@ def emit(out, rows, decoded, mine, dispatches, title):
     p(f"Samples  : {len(rows):6d}  raw")
     p(f"           {len(decoded):6d}  with decoded instruction text")
     p(f"           {len(decoded) - len(mine):6d}  from OTHER kernels -- EXCLUDED")
-    p(f"           {len(mine):6d}  from this kernel (dispatch {','.join(sorted(dispatches, key=int))})")
+    sampled = sorted({r["Dispatch_Id"] for r in mine}, key=int)
+    p(f"           {len(mine):6d}  from this kernel (dispatch {','.join(sampled)})")
+    if ktrace:
+        p(f"           kernel resolved via --kernel-trace (authoritative)")
     p(f"             -> {len(stalled)} stalled / {len(issued)} issued")
     p("")
 
@@ -209,9 +232,10 @@ def emit(out, rows, decoded, mine, dispatches, title):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", help="pc_pc_sampling_stochastic.csv from rocprofv3")
+    ap.add_argument("--kernel-trace", help="kernel_trace csv from the same run (strongly recommended)")
+    ap.add_argument("--kernel", help="keep dispatches whose Kernel_Name contains this (needs --kernel-trace)")
     ap.add_argument("--dispatch", help="comma-separated Dispatch_Id values to keep")
-    ap.add_argument("--match", help="keep dispatches containing this opcode substring")
-    ap.add_argument("--list", action="store_true", help="list dispatches and exit")
+    ap.add_argument("--list", action="store_true", help="list what got sampled, then exit")
     ap.add_argument("-o", "--out", help="write report to this file (default: stdout)")
     ap.add_argument("--title", default="kernel", help="title for the report header")
     a = ap.parse_args()
@@ -221,24 +245,38 @@ def main():
     if not decoded:
         sys.exit("error: no samples with decoded instructions")
 
+    ktrace = load_kernel_trace(a.kernel_trace) if a.kernel_trace else None
+
     if a.list:
-        list_dispatches(decoded)
+        list_kernels(decoded, ktrace)
         return
 
-    if a.dispatch:
-        keep = set(a.dispatch.split(","))
-    elif a.match:
-        keep = {r["Dispatch_Id"] for r in decoded if a.match in r["Instruction"]}
+    if a.kernel:
+        if not ktrace:
+            sys.exit("error: --kernel needs --kernel-trace (the PC csv has no kernel names)")
+        keep = {d for d, n in ktrace.items() if a.kernel in n}
         if not keep:
-            sys.exit(f"error: no dispatch contains an instruction matching {a.match!r}")
-        print(f"--match {a.match!r} -> dispatch {','.join(sorted(keep, key=int))}", file=sys.stderr)
+            sys.exit(f"error: no kernel name contains {a.kernel!r} -- try --list")
+        sampled = {r["Dispatch_Id"] for r in decoded}
+        print(
+            f"--kernel {a.kernel!r} -> {len(keep)} dispatches, "
+            f"{len(keep & sampled)} of them sampled",
+            file=sys.stderr,
+        )
+    elif a.dispatch:
+        keep = set(a.dispatch.split(","))
+        if not ktrace:
+            print(
+                "warning: no --kernel-trace, cannot verify these dispatches belong to one kernel",
+                file=sys.stderr,
+            )
     else:
-        sys.exit("error: need --dispatch, --match, or --list (see --help)")
+        sys.exit("error: need --kernel (with --kernel-trace), --dispatch, or --list")
 
     mine = [r for r in decoded if r["Dispatch_Id"] in keep]
     if not mine:
         sys.exit("error: no samples matched those dispatch ids")
-    emit(a.out, rows, decoded, mine, keep, a.title)
+    emit(a.out, rows, decoded, mine, keep, a.title, ktrace)
 
 
 if __name__ == "__main__":
