@@ -123,9 +123,12 @@ PMC 只能告诉你"哪个硬件单元堵了",PC Sampling 能告诉你**哪条�
 
 ```bash
 rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
-          --pc-sampling-unit cycles --pc-sampling-interval 1048576 \
-          --kernel-include-regex "你的kernel" --output-format csv -d out -o pc -- ./your_app
+          --pc-sampling-unit cycles --pc-sampling-interval 65536 \
+          --kernel-trace \
+          --output-format csv -d out -o pc -- ./your_app
 ```
+
+⚠️ 注意这里用 `--kernel-trace` 而**不是** `--kernel-include-regex`——后者不过滤 PC sampling 数据流。
 
 看 `Stall_Reason` 字段,**关键是分清两个 ARBITER**:
 
@@ -136,8 +139,9 @@ rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
 
 本文案例:`ARBITER_WIN_EX_STALL` 占 **68.8%**,其中 **83% 是 VMEM 指令**(`buffer_store_short` 53.8% + `buffer_load_dwordx4` 23.2%)——和 PMC 的 27.2% 相互印证。
 
-> ⚠️ **必须过滤两次**:① `Instruction` 字段非空 ② 只保留本 kernel 的 `Dispatch_Id`。
-> **`--kernel-include-regex` 不过滤 PC sampling 数据流**,少一道就会看到假的 "WAITCNT 79%"。详见 §7.1。
+> ⚠️ **必须过滤两次**:① `Instruction` 字段非空 ② 用 `--kernel-trace` 的对照表只保留本 kernel。
+> **`--kernel-include-regex` 不过滤 PC sampling 数据流**(有源码依据),少一道就会看到假的 "WAITCNT 79%"。
+> 详见 §7.1 和 [02 §3.2](02-pc-sampling-howto.md)。
 >
 > **不建议用它替代 PMC 先跑**:更慢(10.7s vs 6.7s)、是抽样、且没有阈值判据。详见 §7.4。
 
@@ -1063,12 +1067,13 @@ grep -c "TA_ADDRESSER_STALLED_CYCLES" \
 [PC Sampling](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/how-to/pc_sampling.html) 周期性抓取每个 wave 的 PC 和状态,直接告诉你**哪条指令在停、为什么停**。gfx950 支持 stochastic 模式(硬件采样,能给出停顿原因):
 
 ```bash
-rocprofv3 --pc-sampling-beta-enabled \
-          --pc-sampling-method stochastic \
-          --pc-sampling-unit cycles --pc-sampling-interval 1048576 \
-          --kernel-include-regex "你的kernel" --output-format csv \
-          -d out -o pc -- ./your_app
+rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
+          --pc-sampling-unit cycles --pc-sampling-interval 65536 \
+          --kernel-trace \
+          --output-format csv -d out -o pc -- ./your_app
 ```
+
+完整方法、配套脚本和源码依据见 [02 · PC Sampling 实战](02-pc-sampling-howto.md)。
 
 ### 7.1 ⚠️ 两道过滤,少一道结论就反了
 
@@ -1105,6 +1110,9 @@ ARBITER_WIN_EX_STALL        9.4%
 
 > ⚠️ **不要用"我的 kernel 独有的指令"来猜。** 通用 opcode 可能和别的 kernel 重合,
 > 而且会漏掉 dispatch(本例真实有 23 个,靠指令反查只找到 5 个)。详见 [02 §3.5](02-pc-sampling-howto.md)。
+>
+> 这个行为是**设计如此**:`is_targeted_kernel()` 在 `tool.cpp` 里只有 4 个调用点
+> (ATT ×2 / PMC / SPM),`pc_sampling_callback()` 不在其中。详见 [02 §3.2](02-pc-sampling-howto.md)。
 
 ### 7.2 过滤后:两种方法指向同一处
 

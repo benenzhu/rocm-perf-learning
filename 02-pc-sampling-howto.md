@@ -9,23 +9,42 @@
 ## TL;DR
 
 ```bash
-# 1. 采样 —— 必须同时加 --kernel-trace,否则无法知道样本属于哪个 kernel
-rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
+# 1. 采样。四个 flag 缺一不可:
+#    --pc-sampling-beta-enabled   PC sampling 目前是 beta,不加不生效
+#    --pc-sampling-method stochastic   只有它给停顿原因(host_trap 没有)
+#    --pc-sampling-interval 65536      cycles 单位下必须是 2 的幂且 >= 65536
+#    --kernel-trace                    ★ 否则无法知道样本属于哪个 kernel
+rocprofv3 --pc-sampling-beta-enabled \
+          --pc-sampling-method stochastic \
           --pc-sampling-unit cycles --pc-sampling-interval 65536 \
           --kernel-trace \
           --output-format csv -d out -o pc -- ./your_app
+# 产出: out/pc_pc_sampling_stochastic.csv   样本
+#       out/pc_kernel_trace.csv             Dispatch_Id -> Kernel_Name
 
-# 2. 看采到了哪些 kernel
+# 2. 看采到了哪些 kernel(先做这步,能立刻看出混入了多少别人的样本)
 ./pc_sampling_report.py out/pc_pc_sampling_stochastic.csv \
     --kernel-trace out/pc_kernel_trace.csv --list
 
 # 3. 按 kernel 名过滤,生成报告
 ./pc_sampling_report.py out/pc_pc_sampling_stochastic.csv \
     --kernel-trace out/pc_kernel_trace.csv \
-    --kernel kernel_gemm --title "my_kernel" -o report.txt
+    --kernel kernel_gemm -o report.txt
 ```
 
-**最容易踩的坑:`--kernel-include-regex` 不过滤 PC sampling 数据流,而 PC sampling 的 csv 里又没有 `Kernel_Name` 列。** 必须靠 `--kernel-trace` 把 `Dispatch_Id` 翻译成 kernel 名。不做这一步,本案例的结论会从「发射受限 68.8%」变成「延迟受限 79%」——**完全相反**。
+第 2 步的输出长这样,一眼能看出问题的严重程度:
+
+```
+ SAMPLES   KERNEL
+    3399   kernel_gemm_0                                   ← 我们要的
+    1205   void at::native::elementwise_kernel_manual_...  ← 混入的
+    1071   void at::native::reduce_kernel<512, 1, ...      ← 混入的
+```
+
+**最容易踩的坑:`--kernel-include-regex` 不过滤 PC sampling 数据流**(§3.2 有源码依据),
+**而 PC sampling 的 csv 里又没有 `Kernel_Name` 列**——只能靠 `--kernel-trace` 把
+`Dispatch_Id` 翻译成 kernel 名。不做这一步,本案例的结论会从「发射受限 68.8%」
+变成「延迟受限 79%」——**完全相反**。
 
 ---
 
@@ -94,6 +113,28 @@ Instruction 字段为空 → PC 落在无法解析的 code object 上
 ```
 
 **即使命令行加了 `--kernel-include-regex "kernel_gemm"`,进程里所有 kernel 的样本照样进 csv**;而你光看这个 csv 又无法知道哪个 dispatch 是谁的。
+
+> **这不是 bug,是设计如此。** 查源码可以确认(`rocprofv3` 本身是个 Python 脚本,
+> 只把参数转成环境变量,真正的过滤在 C++ 库里):
+>
+> **① 官方 help 原文就限定了作用范围**——只承诺这两类数据:
+> > *"Include the kernels matching this filter from **counter-collection and thread-trace** data"*
+>
+> **② C++ 侧的过滤函数 `is_targeted_kernel()` 全文只有 4 个调用点**
+> (`rocprofiler-sdk/source/lib/rocprofiler-sdk-tool/tool.cpp`):
+>
+> | 行号 | 函数 | 数据流 |
+> |---|---|---|
+> | 1769 | `att_dispatch_callback` | thread trace |
+> | 1800 | `att_dispatch_consecutive_kernel_callback` | thread trace |
+> | 1869 | `counter_dispatch_callback` | **PMC** |
+> | 2003 | `spm_dispatch_callback` | SPM |
+>
+> **`pc_sampling_callback()`(同文件 1659 行)里一次都没调用它。**
+>
+> 想想也合理:PC sampling 是**周期性硬件采样**,采的是"此刻各 wave 的 PC",
+> 而不是"per-dispatch 收集数据"——它没有一个天然的时机去判断"这次 dispatch 要不要采"。
+> 所以**别浪费时间试各种 flag 组合,老老实实用 `--kernel-trace` join**。
 
 **正解:采样时同时开 `--kernel-trace`**,它会生成一份 `Dispatch_Id → Kernel_Name` 的对照表,join 一下就能精确分离:
 
