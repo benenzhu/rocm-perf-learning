@@ -117,6 +117,29 @@ dump ISA 数出每类指令条数,乘以各自 tag 访问数求和,**和 `TCP_TO
 > **两者都不算错,但绝不能混着比。** 本文统一用 `EN1`(和 1600 面板一致),
 > 阈值 10% 也来自那套配置。换分母时记得阈值要跟着换。
 
+### 第 5 步(可选):用 PC Sampling 定位到指令
+
+PMC 只能告诉你"哪个硬件单元堵了",PC Sampling 能告诉你**哪条指令**:
+
+```bash
+rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
+          --pc-sampling-unit cycles --pc-sampling-interval 1048576 \
+          --kernel-include-regex "你的kernel" --output-format csv -d out -o pc -- ./your_app
+```
+
+看 `Stall_Reason` 字段,**关键是分清两个 ARBITER**:
+
+| | 含义 |
+|---|---|
+| `ARBITER_WIN_EX_STALL` | **赢了仲裁但执行单元不收** ← 对应发射停顿 |
+| `ARBITER_NOT_WIN` | 没抢到发射槽(wave 之间竞争),**不是**同一回事 |
+
+本文案例:`ARBITER_WIN_EX_STALL` 占 31.4%,其中 **48% 落在 `buffer_load_dwordx4` 上**——和 PMC 的 27.2% 相互印证。
+
+> ⚠️ **必须先按 `Instruction` 字段非空过滤**,否则别的 kernel 的样本会让你看到假的 "WAITCNT 79%",结论完全反向。详见 §7.1。
+>
+> **不建议用它替代 PMC 先跑**:更慢(10.7s vs 6.7s)、是抽样(±5.2% 误差)、且没有阈值判据。详见 §7.4。
+
 ### 五条保命经验
 
 1. **发射受限和延迟受限的药方相反。** 前者要**减少**请求,后者要**增加** inflight。搞反了越优化越慢。
@@ -1032,7 +1055,121 @@ grep -c "TA_ADDRESSER_STALLED_CYCLES" \
 
 ---
 
-## 7. 速查表
+## 7. 用 PC Sampling 交叉验证
+
+前面全部结论都建立在 PMC 上。**换一种完全独立的方法验证一遍**——如果两者指向同一处,结论才真的可信。
+
+[PC Sampling](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/how-to/pc_sampling.html) 周期性抓取每个 wave 的 PC 和状态,直接告诉你**哪条指令在停、为什么停**。gfx950 支持 stochastic 模式(硬件采样,能给出停顿原因):
+
+```bash
+rocprofv3 --pc-sampling-beta-enabled \
+          --pc-sampling-method stochastic \
+          --pc-sampling-unit cycles --pc-sampling-interval 1048576 \
+          --kernel-include-regex "你的kernel" --output-format csv \
+          -d out -o pc -- ./your_app
+```
+
+### 7.1 ⚠️ 先过滤,否则结论会完全反过来
+
+原始输出直接汇总,得到的是:
+
+```
+WAITCNT                    79.0%   ← 看起来是延迟受限?!
+ARBITER_WIN_EX_STALL        9.4%
+```
+
+**这个结论是错的。** 检查 `Instruction` 字段:
+
+```
+总样本 1140
+├─ 729 个 NO_INST(PC 解析不出来,落在别的 code object)→ 其中 724 个是 WAITCNT
+└─ 411 个真正解析到我们 kernel 的指令   ← 只有这些有效
+```
+
+那 724 个 WAITCNT 来自 **PyTorch 的其他 kernel**(量化、shuffle 等算子),不是我们的。
+
+> **必须先按 `Instruction` 字段非空过滤。** 这一步不做,PC Sampling 会把你引向完全相反的方向。
+
+### 7.2 过滤后:两种方法指向同一处
+
+kernel 内、未发射样本的真实分布(n=309):
+
+| 停顿原因 | 占比 | 含义 |
+|---|---|---|
+| **`ARBITER_WIN_EX_STALL`** | **31.4%** | **赢了仲裁,但执行单元不收** ← 发射受限 |
+| `WAITCNT` | 30.1% | 等数据返回 |
+| `NO_INSTRUCTION_AVAILABLE` | 17.5% | 取指跟不上 |
+| `ARBITER_NOT_WIN` | 12.0% | 仲裁竞争,别的 wave 抢走了 |
+| `ALU_DEPENDENCY` | 6.1% | |
+| `BARRIER_WAIT` | 2.9% | |
+
+**分清这两个 ARBITER 很关键:**
+
+- **`ARBITER_NOT_WIN`** = 没抢到发射槽(wave 之间竞争)
+- **`ARBITER_WIN_EX_STALL`** = **抢到了却发不出去,因为下游满了** ← 这才对应 `SQ_VMEM_TA_*_FIFO_FULL`
+
+再看 `ARBITER_WIN_EX_STALL` 落在哪些指令上:
+
+```
+    47  buffer_load_dwordx4        ← 48%,就是 G2S
+    28  v_mfma_scale_f32_16x16x128
+    13  buffer_store_short
+```
+
+**近一半的"赢了仲裁却发不出去"发生在 `buffer_load_dwordx4` 上。** 这正是 §3.1 那个 27.2% 在指令级的样子——PMC 说"VMEM 发射被 TA 队列堵住",PC Sampling 说"堵的就是这条 `buffer_load`"。
+
+对照 `ARBITER_NOT_WIN` 的分布,**没有一条是 VMEM**,全是 SALU/VALU 小指令:
+
+```
+     4  s_or_b64        4  v_cmp_u_f32_e32       3  s_cmp_lt_i32  ...
+```
+
+**两种独立方法、同一个结论。**
+
+### 7.3 附带发现:I-cache 可能还有问题
+
+`NO_INSTRUCTION_AVAILABLE` **17.5%** 是 PMC 那几趟没看出来的——**取指跟不上**(`s_load_dword` 也有 22 个停顿样本)。
+
+这和 kernel 源码里的注释对得上:
+
+> *"fully unrolling all 30 main steps blew .text to ~59KB > 32KB I-cache → periodic instruction-fetch stalls"*
+
+作者已经改用 `scf.for` 缓解,但 17.5% 说明**还有残留**。这是条新线索。
+
+### 7.4 那应该先跑 PC Sampling 吗?
+
+一个自然的想法是:PC Sampling 直接指到指令,是不是该先跑?**实测下来答案是否定的**,建议仍然 **PMC 先行**:
+
+| | PMC(第 1 步那趟) | PC Sampling |
+|---|---|---|
+| 耗时 | **6.7 s** | 10.7 s |
+| 统计基础 | 全量计数,**1280 万个周期** | **抽样**,过滤后仅 309 个有效停顿样本 |
+| 误差 | 无抽样误差 | 31.4% **± 5.2%**(95% CI) |
+| 阈值 | 有官方判据(≥10%) | **无**,只能看相对占比 |
+| 数据可信度 | 直接可用 | **必须先过滤 NO_INST**,否则结论反向 |
+| 定位精度 | 到硬件单元 | **到具体指令** ← 优势 |
+
+三个理由:
+
+1. **PC Sampling 更慢**(本例 10.7s vs 6.7s),"更快"是错觉
+2. **样本量小**:过滤后只剩 309 个停顿样本,31.4% 的 95% 置信区间是 ±5.2%。**PMC 是全量计数,没有这个问题**
+3. **没有阈值可依**:PMC 有"≥10% 即认定反压"这样的官方判据;PC Sampling 只有相对占比,31.4% vs 30.1% 这种接近的数字**很难单独下结论**
+
+**正确的用法是互补:**
+
+```
+PMC 定方向(哪个硬件单元、超没超阈值)
+   ↓
+PC Sampling 定位置(具体哪条指令)
+   ↓
+两者一致 → 结论可信;不一致 → 有一方的理解错了,继续查
+```
+
+反过来先跑 PC Sampling 也不是不行,但你会拿着"31.4% ARBITER_WIN_EX_STALL"不知道**这算高还是不算高**——没有基准。
+
+---
+
+## 8. 速查表
 
 > 判定流程和核心公式见开头的 **TL;DR**。这里是完整参考:每站的计数器归属、全部公式、以及经验总结。
 
@@ -1105,8 +1242,9 @@ SQ:8   SPI:6   TCP:4   TCC:4   TA:2   TD:2   CPC:2   CPF:2   GRBM:2
 ## 下一篇
 
 - 把 scale 加载合并成 `dwordx4`,看发射停顿率能降多少
-- LDS shuffle + `float4` 宽存改造 epilogue,冲那 46 µs 固定开销
-- 优化后重新跑同一套 PMC,验证瓶颈是否真的转移
+- LDS shuffle + `float4` 宽存改造 epilogue,冲那 46 µs 固定开销(store 浪费倍数 2.0,是唯一两条路都有空间的)
+- 顺着 §7.3 那条线索查 I-cache:`NO_INSTRUCTION_AVAILABLE` 17.5% 是怎么来的
+- 优化后重新跑同一套 PMC + PC Sampling,验证瓶颈是否真的转移
 
 ---
 
