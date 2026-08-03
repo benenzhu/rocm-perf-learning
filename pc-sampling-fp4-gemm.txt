@@ -1,56 +1,33 @@
 ====================================================================================================
-PC SAMPLING REPORT  --  fp4_gemm_4wave  (kernel_gemm_0)
+PC SAMPLING REPORT  --  fp4_gemm_4wave (kernel_gemm_0)  --  MI355X gfx950
 ====================================================================================================
-GPU      : AMD Instinct MI355X (gfx950 / CDNA4)
-Kernel   : fp4_gemm_4wave   M=N=8192  K=1024   BLOCK 256x256   4 waves/workgroup
-Source   : kernels/gemm/fp4_gemm_4wave.py  (FlyDSL)
-Baseline : 242 us @ M=N=K=8192  (~4500 TFLOPS)
-
-Command  : rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
-                     --pc-sampling-unit cycles --pc-sampling-interval 65536 \
-                     --output-format csv -d out -o pc -- python3 prof_fp4.py
-
-Samples  :  9656  raw
-            7869  with decoded instruction text
-            4863  from OTHER kernels (PyTorch quant/shuffle) -- EXCLUDED
-            3006  from kernel_gemm_0  (dispatch ids 143,144,145,146)
+Samples  :   9656  raw
+             7869  with decoded instruction text
+             4863  from OTHER kernels -- EXCLUDED
+             3006  from this kernel (dispatch 143,144,145,146)
              -> 2232 stalled / 774 issued
 
-!! TWO FILTERS ARE REQUIRED, BOTH EASY TO MISS !!
-   (1) Drop rows with empty Instruction  (PC not resolvable to any code object).
-   (2) Keep only THIS kernel dispatch ids.  --kernel-include-regex does NOT filter
-       the PC sampling stream: samples from every kernel in the process still land
-       in the csv.  Separate by Dispatch_Id (or by an opcode unique to your kernel).
-   Skipping (2) here would report ARBITER_WIN_EX_STALL as 26% instead of the true 67%,
-   and would attribute global_load_* stalls to a kernel that contains no such op.
-
 ====================================================================================================
-1. STALL REASONS   (stalled samples of kernel_gemm_0, n=2232)
+1. STALL REASONS  (n=2232)
 ====================================================================================================
 
   REASON                        COUNT      PCT
   --------------------------------------------------------------------------------
-  ARBITER_WIN_EX_STALL           1488    66.7%   ###############################
-  BARRIER_WAIT                    333    14.9%   #######
-  ALU_DEPENDENCY                  208     9.3%   ####
-  WAITCNT                         189     8.5%   ####
-  NO_INSTRUCTION_AVAILABLE          9     0.4%   
-  ARBITER_NOT_WIN                   4     0.2%   
-  INTERNAL_INSTRUCTION              1     0.0%   
+  ARBITER_WIN_EX_STALL           1488   66.7%   ###############################
+  BARRIER_WAIT                    333   14.9%   #######
+  ALU_DEPENDENCY                  208    9.3%   ####
+  WAITCNT                         189    8.5%   ####
+  NO_INSTRUCTION_AVAILABLE          9    0.4%   
+  ARBITER_NOT_WIN                   4    0.2%   
+  INTERNAL_INSTRUCTION              1    0.0%   
 
-  ARBITER_WIN_EX_STALL : won arbitration, the execution unit refused the
-                         instruction -> downstream (TA/LDS/MFMA) is full.
-                         THIS IS THE ISSUE STALL.
-  ARBITER_NOT_WIN      : lost arbitration to another wave. A different problem,
-                         and negligible here (0.2%).
-  WAITCNT              : waiting on s_waitcnt for data. Only 8.5% -- the kernel
-                         already hides memory latency well (32 loads in flight).
-
-  => Issue-side (66.7%) dominates latency-side (8.5%) by 7.9x.
-     This independently confirms the PMC result SQ_VMEM_TA_CMD_FIFO_FULL = 27.2%.
+  ARBITER_WIN_EX_STALL : won arbitration, execution unit refused it
+                         -> downstream (TA / LDS / MFMA) is full. ISSUE STALL.
+  ARBITER_NOT_WIN      : lost arbitration to another wave. Different problem.
+  WAITCNT              : waiting on s_waitcnt for data. LATENCY, not issue.
 
 ====================================================================================================
-2. ARBITER_WIN_EX_STALL BY INSTRUCTION   (the issue-stall signal)
+2. ARBITER_WIN_EX_STALL BY INSTRUCTION  (the issue-stall signal)
 ====================================================================================================
 
   Total: 1488 samples (66.7% of all stalls)
@@ -74,15 +51,6 @@ Samples  :  9656  raw
          1     0.1%   v_lshrrev_b32_e32                  
 
   VMEM (buffer_*/global_*/flat_*): 1252 / 1488 = 84.1%
-
-  Reading this table:
-    buffer_store_short   813 (54.6%)  epilogue, 256 per wave, each moves only 2B/lane
-    buffer_load_dwordx4  377 (25.3%)  G2S main data, direct-to-LDS, 64 per wave
-    buffer_load_dword     62 (4.2%)  scale loads, 32 per wave, 4B/lane
-
-  The store is the single largest issue stall -- consistent with its waste ratio
-  of 2.0 (4 tag accesses to move 128B, floor is 2). G2S is second by count but has
-  waste ratio 1.0, i.e. its tag traffic is irreducible.
 
 ====================================================================================================
 3. ALL STALLED INSTRUCTIONS
@@ -137,7 +105,7 @@ Samples  :  9656  raw
   s_nop                                  0             0             0             0             0             0             1         1
 
 ====================================================================================================
-5. INSTRUCTION TYPE MIX   (all kernel_gemm_0 samples, n=3006)
+5. INSTRUCTION TYPE MIX  (all samples, n=3006)
 ====================================================================================================
 
   TYPE                        COUNT      PCT
@@ -150,11 +118,8 @@ Samples  :  9656  raw
   LDS                            58     1.9%
   BARRIER                         2     0.1%
 
-  TEX = vector memory (buffer/global). NO_INST rows here are decoded but the
-  sampler classified no functional unit (s_nop, exec-mask ops, etc.).
-
 ====================================================================================================
-6. HOTTEST PCs   (top 30 by stalled samples)
+6. HOTTEST PCs  (top 30 by stalled samples)
 ====================================================================================================
 
   STALLED  DOMINANT        INSTRUCTION
