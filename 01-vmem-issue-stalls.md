@@ -35,7 +35,7 @@
 | **TD** | **T**exture **D**ata | **数据返回单元**。把数据送回 VGPR |
 | **TCP** | **T**exture **C**ache **P**er pipe | **vL1D**,每个 CU 的 L1 向量缓存 |
 | **TCC** | **T**exture **C**ache per **C**hannel | **L2 缓存**,全 XCD 共享,分 16 个 channel |
-| **TCA** | **T**exture **C**ache **A**rbiter | L1↔L2 之间的**交叉开关** |
+| **TCA** | **T**exture **C**ache **A**rbiter | L1↔L2 之间的 **crossbar** |
 | **TCR** | **T**exture **C**ache **R**equest | TCP 发往 L2 的**请求接口**,见 `TCP_TCR_*` |
 | **EA** | **E**fficiency **A**rbiter | **访存接口**,L2 之外通往 HBM/跨die/PCIe |
 | **UTCL1/2** | **U**nified **T**ranslation **C**ache | **TLB**(地址翻译缓存),L1/L2 两级 |
