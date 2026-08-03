@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Aggregate a rocprofv3 stochastic PC-sampling CSV into a readable stall report.
+"""Aggregate PC-sampling output into a readable stall report.
+
+Reads either
+  * a rocprofv3 stochastic PC-sampling csv  (--kernel-trace to resolve names), or
+  * the "21. PC Sampling" table of a `rocprof-compute analyze` text report
+    (--from-analyze), which already filters by kernel via -k and additionally
+    reports count_issued / count_stalled per instruction.
+
+rocprofv3 emits one row per sample and rocprof-compute one row per PC; neither
+gives you the two numbers you actually decide on: the overall stall-reason
+split, and which opcode dominates the issue stalls. That is what this produces.
 
 rocprofv3 emits one row per sample; this turns that into the tables you
 actually want: stall reasons, which instructions stall, and a reason x
@@ -24,6 +34,7 @@ Usage
 import argparse
 import collections
 import csv
+import re
 import sys
 
 REASON = "ROCPROFILER_PC_SAMPLING_INSTRUCTION_NOT_ISSUED_REASON_"
@@ -65,6 +76,10 @@ def opcode(r):
     return r["Instruction"].strip().split()[0]
 
 
+def opcode_of(instr):
+    return instr.strip().split()[0]
+
+
 def load(path):
     rows = list(csv.DictReader(open(path)))
     if rows and "Stall_Reason" not in rows[0]:
@@ -73,6 +88,159 @@ def load(path):
             "       Re-run with --pc-sampling-method stochastic to get stall reasons."
         )
     return rows
+
+
+def parse_analyze_report(path):
+    """Rows of the '21. PC Sampling' table from a rocprof-compute analyze report.
+
+    Columns: index | source_line | instruction | code_object_id | offset |
+             count | count_issued | count_stalled | stall_reason | Kernel_Name
+    """
+    out = []
+    for line in open(path):
+        if "\u2502" not in line:
+            continue
+        f = [x.strip() for x in line.split("\u2502")]
+        if len(f) < 11 or f[1] == "index" or not f[3]:
+            continue
+        try:
+            row = {
+                "instr": f[3],
+                "offset": f[4],
+                "count": int(f[6]),
+                "issued": int(f[7]),
+                "stalled": int(f[8]),
+                "kernel": f[10],
+            }
+        except ValueError:
+            continue
+        row["reasons"] = {m[0]: int(m[1]) for m in re.findall(r"\('(\w+)', (\d+)\)", f[9])}
+        out.append(row)
+    if not out:
+        sys.exit(f"error: no '21. PC Sampling' table rows found in {path}")
+    return out
+
+
+def emit_from_analyze(out, rows, title):
+    """Report built from a rocprof-compute analyze table."""
+    L = []
+    p = L.append
+
+    def rule(c="="):
+        p(c * 100)
+
+    tot_c = sum(r["count"] for r in rows)
+    tot_i = sum(r["issued"] for r in rows)
+    tot_s = sum(r["stalled"] for r in rows)
+    kernels = sorted({r["kernel"] for r in rows})
+
+    rule()
+    p(f"PC SAMPLING REPORT  --  {title}")
+    rule()
+    p("Source   : rocprof-compute analyze (section 21. PC Sampling)")
+    p(f"Kernel(s): {', '.join(kernels)}")
+    p(f"PCs      : {len(rows)} distinct program counters")
+    p(f"Samples  : {tot_c} total = {tot_i} issued + {tot_s} stalled")
+    p("")
+    p("NOTE  Percentages below use count_stalled as the denominator.")
+    p("      Do not sum the stall_reason column directly: it also carries an")
+    p(f"      OTHER_WAIT entry for issued samples (here ~{tot_i}), which would")
+    p("      dilute every real stall reason.")
+    p("")
+
+    rule()
+    p(f"1. STALL REASONS  (n={tot_s})")
+    rule()
+    p("")
+    c = collections.Counter()
+    for r in rows:
+        for k, v in r["reasons"].items():
+            if k != "OTHER_WAIT":
+                c[k] += v
+    tot = sum(c.values())
+    p(f"  {'REASON':<26} {'COUNT':>8} {'PCT':>8}")
+    p("  " + "-" * 80)
+    for k, v in c.most_common():
+        p(f"  {k:<26} {v:8d} {100*v/tot:6.1f}%   {'#' * round(46*v/tot)}")
+    p("")
+    p("  ARBITER_WIN_EX_STALL : won arbitration, execution unit refused it")
+    p("                         -> downstream (TA / LDS / MFMA) is full. ISSUE STALL.")
+    p("  ARBITER_NOT_WIN      : lost arbitration to another wave. Different problem.")
+    p("  WAITCNT              : waiting on s_waitcnt for data. LATENCY, not issue.")
+    p("")
+
+    agg = collections.defaultdict(lambda: [0, 0, 0, collections.Counter()])
+    for r in rows:
+        a = agg[opcode_of(r["instr"])]
+        a[0] += r["count"]
+        a[1] += r["issued"]
+        a[2] += r["stalled"]
+        for k, v in r["reasons"].items():
+            if k != "OTHER_WAIT":
+                a[3][k] += v
+
+    rule()
+    p("2. STALL RATE PER INSTRUCTION  (count_stalled / count)")
+    rule()
+    p("")
+    p("  How often each opcode fails to issue when sampled. This is the one thing")
+    p("  PMC cannot tell you -- it is per-instruction, not per-hardware-unit.")
+    p("")
+    p(f"  {'INSTRUCTION':<34} {'COUNT':>7} {'ISSUED':>7} {'STALLED':>8} {'STALL%':>8}")
+    p("  " + "-" * 80)
+    for k, (cc, ii, ss, _) in sorted(agg.items(), key=lambda kv: -kv[1][2])[:20]:
+        p(f"  {k[:34]:<34} {cc:7d} {ii:7d} {ss:8d} {100*ss/cc:7.1f}%")
+    p("")
+
+    rule()
+    p("3. ARBITER_WIN_EX_STALL BY INSTRUCTION  (the issue-stall signal)")
+    rule()
+    p("")
+    ex = {k: v[3]["ARBITER_WIN_EX_STALL"] for k, v in agg.items() if v[3]["ARBITER_WIN_EX_STALL"]}
+    te = sum(ex.values())
+    p(f"  Total: {te} samples ({100*te/tot_s:.1f}% of all stalls)")
+    p("")
+    p(f"  {'COUNT':>8} {'PCT':>8}   INSTRUCTION")
+    p("  " + "-" * 80)
+    for k, v in sorted(ex.items(), key=lambda kv: -kv[1])[:15]:
+        p(f"  {v:8d} {100*v/te:7.1f}%   {k[:34]:<34} {'#' * round(38*v/te)}")
+    vm = sum(v for k, v in ex.items() if k.startswith(VMEM_PREFIX))
+    p("")
+    p(f"  VMEM (buffer_*/global_*/flat_*): {vm} / {te} = {100*vm/te:.1f}%")
+    p("")
+
+    present = [r for r in ORDER if any(r in x["reasons"] for x in rows)]
+    rule()
+    p("4. STALL REASON x INSTRUCTION")
+    rule()
+    p("")
+    p(f"  {'INSTRUCTION':<26} " + " ".join(f"{ABBR[r]:>13}" for r in present) + f" {'TOTAL':>9}")
+    p("  " + "-" * (28 + 14 * len(present) + 10))
+    for k, (_, _, ss, rc) in sorted(agg.items(), key=lambda kv: -kv[1][2])[:18]:
+        p(f"  {k[:26]:<26} " + " ".join(f"{rc[r]:13d}" for r in present) + f" {ss:9d}")
+    p("")
+
+    rule()
+    p("5. HOTTEST PCs  (top 30 by stalled samples)")
+    rule()
+    p("")
+    p(f"  {'STALLED':>7} {'OFFSET':>10}  {'DOMINANT':<14}  INSTRUCTION")
+    p("  " + "-" * 96)
+    for r in sorted(rows, key=lambda r: -r["stalled"])[:30]:
+        real = {k: v for k, v in r["reasons"].items() if k != "OTHER_WAIT"}
+        dom = ABBR.get(max(real, key=real.get), "-") if real else "-"
+        p(f"  {r['stalled']:7d} {r['offset']:>10}  {dom:<14}  {r['instr'][:60]}")
+    p("")
+    rule()
+    p("END OF REPORT")
+    rule()
+
+    text = "\n".join(L) + "\n"
+    if out:
+        open(out, "w").write(text)
+        print(f"wrote {out} ({len(L)} lines)")
+    else:
+        print(text)
 
 
 def load_kernel_trace(path):
@@ -231,7 +399,12 @@ def emit(out, rows, decoded, mine, dispatches, title, ktrace=None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("csv", help="pc_pc_sampling_stochastic.csv from rocprofv3")
+    ap.add_argument("csv", help="rocprofv3 pc sampling csv, or an analyze report with --from-analyze")
+    ap.add_argument(
+        "--from-analyze",
+        action="store_true",
+        help="input is a `rocprof-compute analyze` text report, not a rocprofv3 csv",
+    )
     ap.add_argument("--kernel-trace", help="kernel_trace csv from the same run (strongly recommended)")
     ap.add_argument("--kernel", help="keep dispatches whose Kernel_Name contains this (needs --kernel-trace)")
     ap.add_argument("--dispatch", help="comma-separated Dispatch_Id values to keep")
@@ -239,6 +412,10 @@ def main():
     ap.add_argument("-o", "--out", help="write report to this file (default: stdout)")
     ap.add_argument("--title", default="kernel", help="title for the report header")
     a = ap.parse_args()
+
+    if a.from_analyze:
+        emit_from_analyze(a.out, parse_analyze_report(a.csv), a.title)
+        return
 
     rows = load(a.csv)
     decoded = [r for r in rows if r["Instruction"].strip()]

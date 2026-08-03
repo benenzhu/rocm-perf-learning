@@ -95,6 +95,9 @@ stochastic : ... + Wave_Issued_Instruction, Instruction_Type,
 
 **这是全文最重要的一节。** 我第一次做这个分析时漏了第二道,得出了完全错误的结论。
 
+> 💡 **用官方 `rocprof-compute analyze -k 0` 可以完全跳过这一节**——它内置了 kernel 过滤。
+> 见 [§7](#7-另一条路官方-rocprof-compute)。本节针对的是直接用 `rocprofv3` 的情况。
+
 ### 3.1 第一道:丢掉 PC 解析不出来的行
 
 ```
@@ -303,23 +306,107 @@ PMC 定方向  →  PC Sampling 定位置  →  两者一致才可信
 
 ---
 
-## 7. 工具用法
+## 7. 另一条路:官方 `rocprof-compute`
 
-[`pc_sampling_report.py`](pc_sampling_report.py) 把 csv 聚合成 6 张表:停顿原因、`ARBITER_WIN_EX_STALL` 按指令分解、全部停顿指令、原因×指令矩阵、指令类型分布、热点 PC。
+前面用的是 `rocprofv3` 直接采集。官方还有一条更完整的路径,**它有两个 `rocprofv3` 给不了的东西**。
 
 ```bash
-# 列出采到了哪些 kernel(先做这步!)
-./pc_sampling_report.py sample.csv --kernel-trace trace.csv --list
+# 采集
+rocprof-compute profile -n pcs --experimental --pc-sampling \
+    --pc-sampling-method stochastic --pc-sampling-interval 65536 -- ./your_app
 
-# 按 kernel 名过滤(推荐)
-./pc_sampling_report.py sample.csv --kernel-trace trace.csv \
-    --kernel kernel_gemm -o report.txt
-
-# 兜底:手动指定 dispatch id(没有 kernel trace 时会警告)
-./pc_sampling_report.py sample.csv --dispatch 143,144,145,146 -o report.txt
+# 分析(-k 0 = 只看 Top Stats 里第 0 个 kernel)
+rocprof-compute analyze -p workloads/pcs/MI355 -k 0 \
+    --pc-sampling-sorting-type count --pc-sampling-rows 0
 ```
 
-两个防呆:误用 `host_trap` 数据会直接报错提示换 stochastic;不带 `--kernel-trace` 用 `--dispatch` 会警告无法验证这些 dispatch 是否属于同一个 kernel。
+输出长这样,每行是**一个 PC 地址**:
+
+```
+│ index │ source_line │ instruction        │ offset │ count │ count_issued │ count_stalled │ stall_reason        │ Kernel_Name   │
+│  1546 │ N/A         │ s_waitcnt vmcnt(0) │ 0x46bc │   144 │            0 │           144 │ [('WAITCNT', 144)]  │ kernel_gemm_0 │
+```
+
+### 7.1 官方独有的两件事
+
+**① `-k 0` 内置 kernel 过滤。** §3 那两道过滤的麻烦,官方 analyze 层已经处理好了——输出直接带 `Kernel_Name` 列。**如果你用官方路径,可以跳过 §3 的全部折腾。**
+
+**② `count_issued` / `count_stalled` 拆分。** 这个很有价值:
+
+```
+INSTRUCTION                          COUNT  ISSUED  STALLED   STALL%
+buffer_store_short                    1367      77     1290    94.4%
+buffer_load_dwordx4                    522      35      487    93.3%
+v_mfma_scale_f32_16x16x128_f8f6f4      522     284      238    45.6%
+v_accvgpr_read_b32                      86      74       12    14.0%
+```
+
+**同一条指令被采样时,有多大比例发不出去。** VMEM 指令 86~94%,VALU 只有 14% —— 这是**每条指令的健康度**,PMC(按硬件单元统计)和只看停顿样本的统计都给不了。
+
+另外还有 `source_line` 列,用 `-g` 编译时能映射回源码行号。
+
+### 7.2 官方缺的:全局聚合
+
+官方输出是**每个 PC 一行**(本例 1126 行),是原始素材而非结论。你没法直接看出:
+
+- 「发射受限占 69.3%」—— 要把 1126 行的 `stall_reason` 全拆开累加
+- 「`buffer_store_short` 占 `ARBITER_WIN_EX_STALL` 的 55%」—— 同一 opcode 散落在几百行里
+
+而这两个恰恰是**判断方向和选优化目标**的关键。
+
+> ⚠️ **聚合时用 `count_stalled`,别直接累加 `stall_reason` 列。**
+> 该列里混了 `OTHER_WAIT`,数量约等于 issued 总数(本例 892 vs 891)——
+> 它其实是"没停顿"。直接累加会把 `ARBITER_WIN_EX_STALL` 从 **69.3%** 稀释到 **52.9%**。
+
+### 7.3 工具:两种输入都支持
+
+[`pc_sampling_report.py`](pc_sampling_report.py) 补的就是这层聚合:
+
+```bash
+# 输入 rocprof-compute analyze 的报告(推荐)
+rocprof-compute analyze -p workloads/pcs/MI355 -k 0 \
+    --pc-sampling-sorting-type count --pc-sampling-rows 0 > analyze.txt
+./pc_sampling_report.py analyze.txt --from-analyze -o report.txt
+
+# 或输入 rocprofv3 的 csv
+./pc_sampling_report.py sample.csv --kernel-trace trace.csv --list
+./pc_sampling_report.py sample.csv --kernel-trace trace.csv \
+    --kernel kernel_gemm -o report.txt
+```
+
+`--from-analyze` 模式额外输出 §7.1 那张**停顿率表**。
+输出样例:[`pc-sampling-official.txt`](pc-sampling-official.txt)(官方数据)·
+[`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt)(rocprofv3 数据)
+
+### 7.4 两条路怎么选
+
+| | `rocprofv3` + 脚本 | `rocprof-compute` |
+|---|---|---|
+| 依赖 | **零**(ROCm 自带) | 重,见下 |
+| kernel 过滤 | 手动 join `--kernel-trace` | ✅ **`-k 0` 内置** |
+| 停顿率(issued/stalled) | ❌ | ✅ |
+| `source_line` 映射 | ❌ | ✅(需 `-g`) |
+| Top Stats / System Info | ❌ | ✅ 同一份报告 |
+| 全局聚合 | ✅ | ❌ 需自己算 |
+
+**两者数据一致**,互为验证:
+
+```
+官方   : ARBITER_WIN_EX_STALL = 1992/2876 = 69.3%
+rocprofv3: ARBITER_WIN_EX_STALL = 2002/2909 = 68.8%
+```
+
+**建议:能装 `rocprof-compute` 就用官方**(`-k 0` 省掉一大堆过滤麻烦,还多两个维度),用脚本的 `--from-analyze` 补聚合。环境受限时 `rocprofv3` 直采是等价的备选。
+
+> **实测安装成本**(ROCm 7.2.4 自带的是 3.4.0,没有 PC sampling,需要用仓库里的 3.8.0):
+> 1. **不能 `pip install -e .`** —— `pyproject.toml` 里只有 ruff 配置,没有 `[build-system]`。直接 `python3 src/rocprof-compute` 运行
+> 2. **`src/vendored/pyyaml/` 是空的**(正常由 CMake 填充)→ 软链到系统 pyyaml:
+>    `ln -s $(python3 -c "import yaml,os;print(os.path.dirname(yaml.__file__))") src/vendored/pyyaml/lib/yaml`
+> 3. **缺 `libdw-dev`**,且 `json` 子模块 clone 会卡住 → `apt install libdw-dev` + 手动 `git clone --depth 1 https://github.com/nlohmann/json.git src/lib/external/json`
+> 4. **analyze 模式的版本锁很严**(且是字符串比较,`tabulate 0.10.0 >= 0.9.0` 也判失败)。
+>    它优先读 `src/requirements.txt`,该文件默认不存在——**放一份去掉版本号的进去即可**,
+>    不用改代码也不用降级任何已装的包:
+>    `sed -E 's/^([a-zA-Z0-9_-]+)[><=]+.*/\1/' requirements.txt > src/requirements.txt`
 
 ---
 
@@ -327,4 +414,5 @@ PMC 定方向  →  PC Sampling 定位置  →  两者一致才可信
 
 - [PC Sampling 官方文档](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/how-to/pc_sampling.html)
 - [01 · 当 vmcnt 不是瓶颈:用 PMC 定位 VMEM 发射停顿](01-vmem-issue-stalls.md)
-- 本案例完整报告:[`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt)
+- 本案例完整报告:[`pc-sampling-official.txt`](pc-sampling-official.txt)(官方路径)·
+  [`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt)(rocprofv3 路径)
