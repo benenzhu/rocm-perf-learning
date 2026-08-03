@@ -30,7 +30,7 @@
 | 缩写 | 全称 | **实际是什么** |
 |---|---|---|
 | **SQ** | **S**e**q**uencer | **wavefront 调度器**。发射指令、管理 wave slot |
-| **SPI** | **S**hader **P**ipe **I**nterpolator | **工作组管理器**。把 workgroup 分派到 CU |
+| **SPI** | **S**hader **P**ipe **I**nterpolator | **workgroup 管理器**。把 workgroup 分派到 CU |
 | **TA** | **T**exture **A**ddresser | **地址生成单元**。算 64 个 lane 的地址并合并 |
 | **TD** | **T**exture **D**ata | **数据返回单元**。把数据送回 VGPR |
 | **TCP** | **T**exture **C**ache **P**er pipe | **vL1D**,每个 CU 的 L1 向量缓存 |
