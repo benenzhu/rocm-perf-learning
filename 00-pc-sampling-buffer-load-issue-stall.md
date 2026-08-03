@@ -1,7 +1,7 @@
 # 00 · ROCm Profiler PC Sampling 笔记:如何定位 buffer_load issue stall
 
 > 平台:AMD Instinct MI355X (gfx950 / CDNA4)
-> 工具:`rocprof-compute` / `rocprofv3`(两条路径都讲,§7 对比)
+> 工具:`rocprof-compute` / `rocprofv3`(两条路径都讲,§6 对比)
 > 案例:一个真实的 MXFP4 GEMM kernel(M=N=K=8192,~4500 TFLOPS)
 > 配套:[`pc_sampling_report.py`](pc_sampling_report.py) · 报告样例 [`pc-sampling-official.txt`](pc-sampling-official.txt)
 
@@ -109,7 +109,7 @@ PMC          SQ_VMEM_TA_CMD_FIFO_FULL 27.2% —— 是 TA 的队列满了
 
 **本篇走第二步**,[01](01-vmem-issue-stalls.md) 走第三步。
 
-PC Sampling 相对 PMC 的取舍(§6 有实测):
+PC Sampling 相对 PMC 的取舍(§5 有实测):
 
 | | PMC | PC Sampling |
 |---|---|---|
@@ -135,132 +135,7 @@ Stall_Reason               ★ 没发出去的话,为什么          ← 全文�
 > 默认 1048576 太稀疏(本例只拿到 309 个有效停顿样本);
 > **用 65536 能拿到 2909 个**,精度从 ±5.2% 提到 ±1.7%。
 
----
-
-## 3. ⚠️ 两道过滤,少一道结论就反了
-
-**这是全文最重要的一节。** 我第一次做这个分析时漏了第二道,得出了完全错误的结论。
-
-> 💡 **用官方 `rocprof-compute analyze -k 0` 可以完全跳过这一节**——它内置了 kernel 过滤。
-> 见 [§7](#7-另一条路官方-rocprof-compute)。本节针对的是直接用 `rocprofv3` 的情况。
-
-### 3.1 第一道:丢掉 PC 解析不出来的行
-
-```
-Instruction 字段为空 → PC 落在无法解析的 code object 上
-```
-
-本例 9656 个原始样本里有 **1787 个**是这种。
-
-### 3.2 第二道:只保留本 kernel 的样本
-
-两个事实叠加造成了这个坑:
-
-```
-① --kernel-include-regex 不过滤 PC sampling 数据流
-② PC sampling 的 csv 里没有 Kernel_Name 列,只有 Dispatch_Id
-```
-
-**即使命令行加了 `--kernel-include-regex "kernel_gemm"`,进程里所有 kernel 的样本照样进 csv**;而你光看这个 csv 又无法知道哪个 dispatch 是谁的。
-
-> **这不是 bug,是设计如此。** 查源码可以确认(`rocprofv3` 本身是个 Python 脚本,
-> 只把参数转成环境变量,真正的过滤在 C++ 库里):
->
-> **① 官方 help 原文就限定了作用范围**——只承诺这两类数据:
-> > *"Include the kernels matching this filter from **counter-collection and thread-trace** data"*
->
-> **② C++ 侧的过滤函数 `is_targeted_kernel()` 全文只有 4 个调用点**
-> (`rocprofiler-sdk/source/lib/rocprofiler-sdk-tool/tool.cpp`):
->
-> | 行号 | 函数 | 数据流 |
-> |---|---|---|
-> | 1769 | `att_dispatch_callback` | thread trace |
-> | 1800 | `att_dispatch_consecutive_kernel_callback` | thread trace |
-> | 1869 | `counter_dispatch_callback` | **PMC** |
-> | 2003 | `spm_dispatch_callback` | SPM |
->
-> **`pc_sampling_callback()`(同文件 1659 行)里一次都没调用它。**
->
-> 想想也合理:PC sampling 是**周期性硬件采样**,采的是"此刻各 wave 的 PC",
-> 而不是"per-dispatch 收集数据"——它没有一个天然的时机去判断"这次 dispatch 要不要采"。
-> 所以**别浪费时间试各种 flag 组合,老老实实用 `--kernel-trace` join**。
-
-**正解:采样时同时开 `--kernel-trace`**,它会生成一份 `Dispatch_Id → Kernel_Name` 的对照表,join 一下就能精确分离:
-
-```bash
-rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
-          --pc-sampling-unit cycles --pc-sampling-interval 65536 \
-          --kernel-trace \
-          --output-format csv -d out -o pc -- ./your_app
-# → out/pc_pc_sampling_stochastic.csv   样本
-# → out/pc_kernel_trace.csv             Dispatch_Id -> Kernel_Name
-```
-
-本例的实际构成:
-
-```
-9853 个原始样本
-├─ 1925  PC 无法解析                             → 丢
-├─ 4147  来自 PyTorch 其他算子(reduce/elementwise 等)  → 丢   ← 占一半!
-└─ 3781  来自 kernel_gemm_0(dispatch 143~147)  ← 只有这些有效
-```
-
-### 3.3 漏掉第二道会怎样
-
-| | 只过滤一道(错) | 两道都做(对) |
-|---|---|---|
-| `WAITCNT` | **79.0%** | 9.5% |
-| `ARBITER_WIN_EX_STALL` | 9.4% | **68.8%** |
-| 结论 | 「延迟受限」 | 「**发射受限**」 |
-
-**完全相反。** 那 79% 的 WAITCNT 全是 PyTorch 量化算子的,和被测 kernel 毫无关系。
-
-### 3.4 怎么发现自己踩了坑
-
-我是靠**指令对不上**发现的:报告里出现了 `global_load_dwordx4` 的停顿,但——
-
-```bash
-$ grep -c global_load kernel_gemm_0/21_final_isa.s
-0
-```
-
-**我们的 kernel 里根本没有这条指令。** 出现了不该有的 opcode,就说明混进了别的 kernel。
-
-**用 `--list` 看采到了哪些 kernel**(有 `--kernel-trace` 时显示真实名字):
-
-```bash
-$ ./pc_sampling_report.py out/pc_pc_sampling_stochastic.csv \
-      --kernel-trace out/pc_kernel_trace.csv --list
-
- SAMPLES   KERNEL
-------------------------------------------------------------------
-    3781   kernel_gemm_0                             ← 我们的
-    1052   void at::native::reduce_kernel<512, 1, ...
-     676   void at::native::elementwise_kernel_manual_unroll<128, ...
-     366   void at::native::vectorized_elementwise_kernel<4, ...
-```
-
-### 3.5 ⚠️ 别用"独有指令"这种启发式来猜
-
-我第一版工具是这么做的:**找出含有 `v_mfma_scale` 的 dispatch,认为那就是我们的 kernel**。看起来能work,实际上有两个问题:
-
-**问题一:别的 kernel 可能共用同样的 opcode。** `buffer_load_dwordx4`、`buffer_store_short` 这种通用指令到处都是,一旦选中的"特征指令"不够独特,就会混入别人的样本——而你不会收到任何警告。
-
-**问题二:会漏掉 dispatch。** 实测对比:
-
-```
-权威(--kernel-trace):  23 个 dispatch  ← kernel_gemm 一共被调用 23 次
-启发式(--match)    :   5 个 dispatch  ← 只有采到样本的那几个
-漏掉的: 148 ~ 165
-```
-
-本例恰好漏掉的那 18 个 dispatch 采样数都是 0(因为 PC sampling 是抽样,不是每次 dispatch 都被采到),所以样本数一致。**但这是运气,不是保证** —— 换个采样间隔或运行时长就可能漏掉真实样本。
-
-**结论:始终用 `--kernel-trace`。** 工具保留了 `--dispatch` 手动指定作为兜底,但没有 kernel trace 时会打印警告。
-
----
-
-## 4. 读懂 `Stall_Reason`
+## 3. 读懂 `Stall_Reason`
 
 拿到干净数据后,核心是这一列。**最关键的是分清两个 ARBITER:**
 
@@ -279,9 +154,9 @@ $ ./pc_sampling_report.py out/pc_pc_sampling_stochastic.csv \
 
 ---
 
-## 5. 本案例的结果
+## 4. 本案例的结果
 
-### 5.1 停顿原因分布(n=2909)
+### 4.1 停顿原因分布(n=2909)
 
 ```
 ARBITER_WIN_EX_STALL     2002   68.8%   ################################
@@ -302,7 +177,7 @@ ARBITER_NOT_WIN             5    0.2%
   ATT 里那些空白段,在这个 kernel 上**不是 I-cache miss**(取指几乎没有停顿),
   更可能是 ATT 自身的采样局限。同样的方法可以用来验证你自己 kernel 里的空白段。
 
-### 5.2 停顿落在哪些指令上
+### 4.2 停顿落在哪些指令上
 
 | 样本数 | 占比 | 指令 | 是什么 |
 |---|---|---|---|
@@ -313,7 +188,7 @@ ARBITER_NOT_WIN             5    0.2%
 
 **VMEM 指令占 `ARBITER_WIN_EX_STALL` 的 83%** —— 和 PMC 说的「VMEM 发射被 TA 堵住」完全一致。
 
-### 5.3 和 PMC 模型互相印证
+### 4.3 和 PMC 模型互相印证
 
 这是 PC Sampling 最有价值的地方 —— 它给出了 PMC 给不了的**排序**:
 
@@ -327,7 +202,7 @@ ARBITER_NOT_WIN             5    0.2%
 
 ---
 
-## 6. 那要不要先跑 PC Sampling?
+## 5. 那要不要先跑 PC Sampling?
 
 一个自然的想法:它能直接指到指令,是不是应该先跑?**实测答案是否定的。**
 
@@ -337,7 +212,7 @@ ARBITER_NOT_WIN             5    0.2%
 | 统计 | 全量,1280 万周期 | 抽样,2909 个有效样本 |
 | 误差 | 无 | ±1.7%(95% CI) |
 | 阈值 | **有**(≥10%) | **无** |
-| 陷阱 | 分母要选对 | **两道过滤,漏了结论反向** |
+| 陷阱 | 分母要选对 | 采样时忘了 `--kernel-trace` |
 
 三个理由:
 
@@ -351,11 +226,11 @@ ARBITER_NOT_WIN             5    0.2%
 PMC 定方向  →  PC Sampling 定位置  →  两者一致才可信
 ```
 
-不一致的话,说明有一方的理解错了(比如漏了过滤),继续查。
+不一致的话,说明有一方的理解错了,继续查——本文和 [01](01-vmem-issue-stalls.md) 就是这么互相印证的。
 
 ---
 
-## 7. 另一条路:官方 `rocprof-compute`
+## 6. 另一条路:官方 `rocprof-compute`
 
 前面用的是 `rocprofv3` 直接采集。官方还有一条更完整的路径,**它有两个 `rocprofv3` 给不了的东西**。
 
@@ -376,9 +251,9 @@ rocprof-compute analyze -p workloads/pcs/MI355 -k 0 \
 │  1546 │ N/A         │ s_waitcnt vmcnt(0) │ 0x46bc │   144 │            0 │           144 │ [('WAITCNT', 144)]  │ kernel_gemm_0 │
 ```
 
-### 7.1 官方独有的两件事
+### 6.1 官方独有的两件事
 
-**① `-k 0` 内置 kernel 过滤。** §3 那两道过滤的麻烦,官方 analyze 层已经处理好了——输出直接带 `Kernel_Name` 列。**如果你用官方路径,可以跳过 §3 的全部折腾。**
+**① `-k 0` 内置 kernel 过滤。** 官方 analyze 层直接按 kernel 名过滤,输出自带 `Kernel_Name` 列——**不需要自己 join `--kernel-trace`**。
 
 **② `count_issued` / `count_stalled` 拆分。** 这个很有价值:
 
@@ -394,7 +269,7 @@ v_accvgpr_read_b32                      86      74       12    14.0%
 
 另外还有 `source_line` 列,用 `-g` 编译时能映射回源码行号。
 
-### 7.2 官方缺的:全局聚合
+### 6.2 官方缺的:全局聚合
 
 官方输出是**每个 PC 一行**(本例 1126 行),是原始素材而非结论。你没法直接看出:
 
@@ -407,7 +282,7 @@ v_accvgpr_read_b32                      86      74       12    14.0%
 > 该列里混了 `OTHER_WAIT`,数量约等于 issued 总数(本例 892 vs 891)——
 > 它其实是"没停顿"。直接累加会把 `ARBITER_WIN_EX_STALL` 从 **69.3%** 稀释到 **52.9%**。
 
-### 7.3 工具:两种输入都支持
+### 6.3 工具:两种输入都支持
 
 [`pc_sampling_report.py`](pc_sampling_report.py) 补的就是这层聚合:
 
@@ -423,11 +298,11 @@ rocprof-compute analyze -p workloads/pcs/MI355 -k 0 \
     --kernel kernel_gemm -o report.txt
 ```
 
-`--from-analyze` 模式额外输出 §7.1 那张**停顿率表**。
+`--from-analyze` 模式额外输出 §6.1 那张**停顿率表**。
 输出样例:[`pc-sampling-official.txt`](pc-sampling-official.txt)(官方数据)·
 [`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt)(rocprofv3 数据)
 
-### 7.4 两条路怎么选
+### 6.4 两条路怎么选
 
 | | `rocprofv3` + 脚本 | `rocprof-compute` |
 |---|---|---|
@@ -459,7 +334,7 @@ rocprofv3: ARBITER_WIN_EX_STALL = 2002/2909 = 68.8%
 
 ---
 
-## 8. 速查:完整流程
+## 7. 速查:完整流程
 
 把前面讲的串起来,可以直接照抄:
 
@@ -496,12 +371,16 @@ rocprofv3 --pc-sampling-beta-enabled \
     1071   void at::native::reduce_kernel<512, 1, ...      ← 混入的
 ```
 
-**再强调一遍最容易踩的坑**([§3](#3--两道过滤少一道结论就反了)):
-`--kernel-include-regex` **不过滤 PC sampling 数据流**,而 PC sampling 的 csv 里
-**又没有 `Kernel_Name` 列**——只能靠 `--kernel-trace` 把 `Dispatch_Id` 翻译成 kernel 名。
-不做这一步,本案例的结论会从「发射受限 68.8%」变成「延迟受限 79%」——**完全相反**。
+**为什么第 1 步一定要带 `--kernel-trace`:** PC sampling 的 csv 里**没有 `Kernel_Name` 列**,
+只有 `Dispatch_Id`;而 `--kernel-include-regex` **不过滤 PC sampling 数据流**(rocprofv3 的
+help 只承诺 counter-collection 和 thread-trace,C++ 侧 `is_targeted_kernel()` 也确实不在
+`pc_sampling_callback()` 里调用)。所以进程里**所有 kernel 的样本都会进 csv**,必须靠
+`--kernel-trace` 生成的 `Dispatch_Id → Kernel_Name` 对照表把它们分开。
 
-> 用官方 `rocprof-compute analyze -k 0` 则内置了 kernel 过滤,可以跳过这一步,见 [§7](#7-另一条路官方-rocprof-compute)。
+**这个 flag 必须在采样时就加,事后补不了。**
+
+> 走官方 `rocprof-compute` 路径则不用管这些,`analyze -k 0` 内置了 kernel 过滤,
+> 见 [§6](#6-另一条路官方-rocprof-compute)。
 
 ---
 

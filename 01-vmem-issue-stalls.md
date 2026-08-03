@@ -145,7 +145,7 @@ rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
 
 > ⚠️ **必须过滤两次**:① `Instruction` 字段非空 ② 用 `--kernel-trace` 的对照表只保留本 kernel。
 > **`--kernel-include-regex` 不过滤 PC sampling 数据流**(有源码依据),少一道就会看到假的 "WAITCNT 79%"。
-> 详见 §7.1 和 [00 §3.2](00-pc-sampling-buffer-load-issue-stall.md)。
+> 详见 §7.1 和 [00 · PC Sampling 笔记](00-pc-sampling-buffer-load-issue-stall.md)。
 >
 > **不建议用它替代 PMC 先跑**:更慢(10.7s vs 6.7s)、是抽样、且没有阈值判据。详见 §7.4。
 
@@ -1113,10 +1113,10 @@ ARBITER_WIN_EX_STALL        9.4%
 漏掉第二道的后果:`ARBITER_WIN_EX_STALL` 显示成 **9.4%** 而非真实的 **68.8%**,`WAITCNT` 显示成 **79%** 而非 **9.5%**——**结论完全反向**。发现线索是报告里出现了 `global_load_*` 的停顿,而我们 kernel 的 ISA 里 `grep -c global_load` 是 **0**。
 
 > ⚠️ **不要用"我的 kernel 独有的指令"来猜。** 通用 opcode 可能和别的 kernel 重合,
-> 而且会漏掉 dispatch(本例真实有 23 个,靠指令反查只找到 5 个)。详见 [00 §3.5](00-pc-sampling-buffer-load-issue-stall.md)。
+> 而且会漏掉 dispatch(本例真实有 23 个,靠指令反查只找到 5 个)。
 >
 > 这个行为是**设计如此**:`is_targeted_kernel()` 在 `tool.cpp` 里只有 4 个调用点
-> (ATT ×2 / PMC / SPM),`pc_sampling_callback()` 不在其中。详见 [00 §3.2](00-pc-sampling-buffer-load-issue-stall.md)。
+> (ATT ×2 / PMC / SPM),`pc_sampling_callback()` 不在其中。详见 [00 · PC Sampling 笔记](00-pc-sampling-buffer-load-issue-stall.md)。
 
 ### 7.2 过滤后:两种方法指向同一处
 
@@ -1203,7 +1203,7 @@ PC Sampling 定位置(具体哪条指令)
 两者一致 → 结论可信;不一致 → 有一方的理解错了,继续查
 ```
 
-反过来先跑 PC Sampling 也不是不行,但你会拿着"68.8% ARBITER_WIN_EX_STALL"不知道**这算高还是不算高**——没有基准,而且很容易漏掉 §7.1 那两道过滤。
+反过来先跑 PC Sampling 也不是不行,但你会拿着"68.8% ARBITER_WIN_EX_STALL"不知道**这算高还是不算高**——没有基准,而且很容易漏掉 kernel 过滤那一步。
 
 > 📄 **完整报告**:[`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt)
 > 含停顿原因分布、`ARBITER_WIN_EX_STALL` 按指令分解、停顿原因 × 指令矩阵、热点 PC 列表。
