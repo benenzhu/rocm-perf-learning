@@ -5,6 +5,83 @@
 
 ---
 
+## TL;DR — 直接照着做
+
+### 第 1 步:一趟采集,判断是不是发射卡住
+
+```bash
+rocprofv3 --pmc SQ_VMEM_TA_CMD_FIFO_FULL SQ_VMEM_TA_ADDR_FIFO_FULL SQ_BUSY_CYCLES \
+                SQ_INSTS_VMEM SQ_WAIT_INST_ANY \
+                TA_TA_BUSY TA_ADDR_STALLED_BY_TC_CYCLES GRBM_GUI_ACTIVE \
+          --kernel-include-regex "你的kernel" --output-format csv \
+          -d out -o p1 -- ./your_app
+```
+
+> 这组刚好卡在硬件槽位上限内(SQ 用 5/8,TA 用 2/2,GRBM 用 1/2),**一趟采完不用重放**。
+
+### 第 2 步:算两个数,查表定位
+
+```
+A = SQ_VMEM_TA_CMD_FIFO_FULL / SQ_BUSY_CYCLES                        ← 发射卡不卡
+B = TA_ADDR_STALLED_BY_TC_CYCLES / (GRBM_PER_XCD × cu_per_gpu)       ← 是不是被下游堵
+                                    ↑ rocprofv3 报的 GRBM 值 ÷ XCD 数(MI355X=8)
+```
+
+| A | B | 诊断 | 下一步 |
+|---|---|---|---|
+| **<10%** | — | **不是发射问题** | 查 `vmcnt` 延迟 / I-cache / wave 数不足 |
+| **≥10%** | **低** | **TA 活太多**(本文案例:A=27.2%, B=0.9%) | → 第 3 步,减少指令数或 tag 访问 |
+| **≥10%** | **高** | TA 被下游反压 | → 第 4 步,查 L1/TLB/L2 |
+
+### 第 3 步(A高B低):建 tag 模型,找真正的浪费
+
+```bash
+rocprofv3 --pmc TA_TOTAL_WAVEFRONTS TA_BUFFER_WAVEFRONTS \
+                TCP_GATE_EN1 TCP_TOTAL_CACHE_ACCESSES \
+                TCP_TCR_TCP_STALL_CYCLES TCP_READ_TAGCONFLICT_STALL_CYCLES ...
+```
+
+**核心公式**(§1.5,本文最实用的部分):
+
+```
+单条指令的 tag 访问数 = 该指令 64 lane 的地址覆盖了几个不同的 64B cacheline
+下限                 = ceil(该指令实际搬运字节数 / 64)
+浪费倍数             = 实际 / 下限        ← 1.0 = 已最优,>1.0 才有优化空间
+```
+
+dump ISA 数出每类指令条数,乘以各自 tag 访问数求和,**和 `TCP_TOTAL_CACHE_ACCESSES` 对得上才算真懂了**(本文模型精确命中 2176,零误差)。然后按**每有效字节代价**排序开刀:
+
+| | 每条 tag 访问 | 浪费倍数 | 结论 |
+|---|---|---|---|
+| G2S 主数据 | 16(最多) | **1.0** | **零浪费,别动** |
+| scale | 4 | 1.0 | 单条最优 → 减指令条数 |
+| store | 4 | **2.0** | 改 lane 映射 + 减条数 |
+
+⚠️ **tag 访问多 ≠ 差。** G2S 产生 47% 的 tag 访问却是全 kernel 写得最好的。
+
+### 第 4 步(A高B高):往下游查
+
+| 查什么 | 公式 | 判据 |
+|---|---|---|
+| L2 反压 L1 | `TCP_TCR_TCP_STALL_CYCLES / TCP_GATE_EN1` | ≥10% |
+| TLB 容量 | `TCP_UTCL1_STALL_INFLIGHT_MAX / TCP_GATE_EN2` | ≥10% |
+| 页表遍历 | `TCP_UTCL1_STALL_LFIFO_NO_RES / TCP_GATE_EN2` | ≥10% |
+| tag 冲突 | `TCP_READ_TAGCONFLICT_STALL_CYCLES / TCP_GATE_EN1` | ≥10% |
+| tag bank 热点 | `TCP_TAGRAM{0..3}_REQ` 是否均衡 | 某 bank ≫25% |
+
+### 五条保命经验
+
+1. **发射受限和延迟受限的药方相反。** 前者要**减少**请求,后者要**增加** inflight。搞反了越优化越慢。
+2. **TA 不是缓存。** `SQ_INSTS_VMEM == TA_TOTAL_WAVEFRONTS`(实测完全相等),提高命中率**不减轻 TA 负担**。
+3. **分母有坑。** `rocprofv3` 报的 `GRBM_GUI_ACTIVE` 是 8 个 XCD 求和值;TA 类要除 XCD 数,TCP 类分母是 `TCP_GATE_EN1`,UTCL1 类是 `TCP_GATE_EN2`。用错会差 16 倍。
+4. **wall-clock 异常先用 GPU 侧计数器验证。** 我曾测到一个 9 倍性能悬崖,结果是测试脚本的问题(§6 坑 1)。
+5. **传闻的坑要实测。** 本文 kernel 完全符合"512B stride"这个著名踩坑条件,实测 tag 冲突却是 **0**(§6 坑 2)。
+
+> **只有 gfx950 有的计数器**:`SQ_VMEM_TA_*_FIFO_FULL`、`TCP_UTCL1_*`、`TCP_TAGRAM{0..3}_REQ`。
+> MI300 上第 1 步做不了,只能靠 `TA_ADDR_STALLED_BY_TC_CYCLES` 间接推断。
+
+---
+
 ## 0. 这篇要解决的问题
 
 打开 [CDNA Performance Model](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/cdna/cdna-performance-model.html),你会看到几百个指标,按 CU、L2、SE、CP 分门别类。文档告诉你每个指标**是什么**,但没告诉你**什么时候该看哪个**。
@@ -908,7 +985,9 @@ grep -c "TA_ADDRESSER_STALLED_CYCLES" \
 
 ## 7. 速查表
 
-**判定流程:**
+> 判定流程和核心公式见开头的 **TL;DR**。这里是完整参考:每站的计数器归属、全部公式、以及经验总结。
+
+**判定流程(展开版):**
 
 ```
 ① SQ_VMEM_TA_CMD_FIFO_FULL / SQ_BUSY_CYCLES  ≥ 10% ?
