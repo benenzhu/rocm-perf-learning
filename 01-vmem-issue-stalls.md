@@ -392,12 +392,47 @@ TA 总开销 ≈ Σ (每条指令归并出的 cacheline 请求数)
 
 前面都是定性的。这一节给一个**能算出具体数字、并且被实测验证的模型**——这是本文最实用的部分,你可以拿去套自己的 kernel。
 
-**核心规则:TA 按 64 字节粒度产生 tag 访问。**
+#### 先说清楚:64B 和 "tag" 到底是什么
 
-对一条 VMEM 指令,把 64 个 lane 要访问的地址铺开,看它**覆盖了多少个 64B 对齐的区间**,那就是这条指令产生的 tag 访问数:
+这两个概念是整个模型的基础,而且**不是经验法则,是硬件定义**。
+
+**64B 从哪来?** 官方文档([Vector L1 cache](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/cdna/vector-l1-cache.html))原文:
+
+> *"All cache accesses in vL1D are for a single cache line's worth of data. The size of a cache line may vary, however on current CDNA architecture-based AMD Instinct MI-Series GPUs and GCN GPUs **the L1 cache line size is 64B**."*
+
+两句话拆开看:
+
+1. **vL1D 的 cacheline = 64B**
+2. **每次 cache 访问只能覆盖一个 cacheline** ← 这条才是关键
+
+所以一条搬 1024B 的指令,**物理上必须拆成 16 次访问**,没有别的可能。
+
+> ⚠️ **L1 是 64B,L2 不是。** TCC 那边是 32B sector 粒度、请求可以是 32/64/128B
+> (看 `TCC_EA0_RDREQ_{32B,64B,128B}` 就知道)。**两级粒度不同,别混用。**
+
+**"tag" 是什么?** vL1D 内部的流水线是这样的:
 
 ```
-tag 访问数 = ceil( 该指令 64 个 lane 覆盖的字节区间数,按 64B 对齐切分 )
+TA 送来地址
+    ↓
+UTCL1 翻译 VA → PA
+    ↓
+Tag RAM 查询   ← "这个 64B cacheline 现在在不在缓存里?"
+    ↓
+命中 → 从 Cache RAM (TC) 取数据
+未命中 → 下发 L2
+```
+
+Tag RAM 存的是**"缓存里当前装着哪些 cacheline 的地址标签"**。要访问任何一个 64B line,**都得先查一次 tag** 才知道命中与否。
+
+**所以 `TCP_TOTAL_CACHE_ACCESSES` 数的是"查了多少次 tag"**,和命中率无关——命中要查,未命中也要查。这就是为什么 §1.4 说"缓存命中率救不了 TA":**查询次数只由你的地址模式决定。**
+
+#### 模型本身
+
+**核心规则:tag 访问数 = 该指令 64 个 lane 的地址覆盖了多少个不同的 64B cacheline。**
+
+```
+tag 访问数 = |{ addr[lane] / 64  :  lane = 0..63 }|      ← 去重后的集合大小
 ```
 
 三种典型情况:
@@ -437,6 +472,73 @@ store : 256 条 ×  4 = 1024
 - **G2S 虽然产生最多 tag 访问(每条 16 个),但它的每 KB 代价是最低档的。** 它在搬真实的数据,这些访问是必需的——**不要动它**。
 - **store 每条只搬 128B 却要 4 个 tag 访问**,每 KB 代价是 G2S 的 2 倍,而且占了 73% 的指令数。
 - scale 的绝对量小,但它的 32 条指令**只搬了 8KB**,而且(下一节会看到)这些数据挤在同一批 cacheline 里被重复请求。
+
+#### 关键:tag 访问数有下限,"多"不等于"浪费"
+
+前面说"降低每条指令跨的 64B 区间数",这个说法**容易误导**,必须补一句:
+
+**区间数有物理下限,你降不到下限以下:**
+
+```
+下限 = ceil( 该指令实际需要搬运的字节数 / 64 )
+```
+
+一条 `buffer_load_dwordx4` 搬 64 lane × 16B = 1024B,**无论怎么优化,至少要 16 次 tag 访问**。
+
+所以真正该问的不是"tag 访问多不多",而是:
+
+```
+浪费倍数 = 实际 tag 访问数 / 下限
+
+= 1.0  → 已经最优,单条指令层面无可优化
+> 1.0  → 有 lane 映射问题,存在优化空间
+```
+
+**套到我们的 kernel:**
+
+| | 实际搬运 | 下限 | 实际 tag 访问 | **浪费倍数** |
+|---|---|---|---|---|
+| G2S | 1024 B | 16 | 16 | **1.0** ✓ 完美 |
+| scale | 256 B | 4 | 4 | **1.0** ✓ 完美 |
+| store | 128 B | 2 | 4 | **2.0** ✗ 翻倍 |
+
+**这个结果可能出乎意料:G2S 产生最多 tag 访问(每条 16 个),却是零浪费的。**
+
+验证一下 G2S 的 lane→地址映射(代码是 `row = lane//8; col = (lane%8)*16`):
+
+```
+lane 0 → addr    0  ┐
+lane 1 → addr   16  │ 4 个 lane 正好拼满一个 64B cacheline
+lane 2 → addr   32  │
+lane 3 → addr   48  ┘
+lane 4 → addr   64  ┐ 下一个 cacheline
+...                 │
+lane 8 → addr  512  ← 换到下一行
+
+64 lane × 16B = 1024 B,覆盖 16 个 64B line,一个字节都没浪费
+```
+
+**这正好回答了一个常见疑问:** `dwordx4` 每 lane 取 16B,而 64B ÷ 16B = 4,
+所以**每 4 个连续 lane 访问连续地址**才能填满一个 cacheline——G2S 做到了。
+如果 lane 0~3 访问的是 4 个相距很远的地址,就会变成 4 次 tag 访问搬 64B,**浪费倍数 4.0**。
+
+#### 两条不同的优化路径,别用错
+
+| | 手段 | **什么时候用** |
+|---|---|---|
+| **路径 A:改 lane 映射** | 调整 swizzle,让相邻 lane 访问连续地址 | **浪费倍数 > 1.0** 时 |
+| **路径 B:减少指令条数** | 用更宽的 load、合并多次访问 | **多条指令落在同一批 cacheline** 时 |
+
+对号入座:
+
+- **G2S**:浪费 1.0,两条路都到头了 → **不要动**
+- **scale**:浪费 1.0,路径 A 无空间 → **走路径 B**(合并多个 K-step,见 §4)
+- **store**:浪费 2.0 且占 73% 指令 → **两条路都有空间**(LDS shuffle 改布局 + `float4` 宽存)
+
+> **为什么 scale 单条完美却还能优化?**
+> 因为它的问题**不在单条指令内部,而在跨指令重复**。
+> 相邻 K-step 的 scale 在内存里紧挨着,分 8 次去取等于把同一片区域切碎了访问。
+> **路径 B 解决的正是这类问题**——§4 会详细算这笔账。
 
 > **这就是为什么必须建模型、不能只看总量。** 单看 "tag 访问" 会觉得 G2S 是大头(47%),
 > 但 G2S 恰恰是写得最好的部分。**要看的是「每有效字节的 TA 代价」。**
@@ -704,7 +806,7 @@ GEMM 的时间应该是 `固定开销 + 每 K-step 开销 × K-step 数`。测 6
 
 ---
 
-## 6. ⚠️ 三个真实踩过的坑
+## 6. ⚠️ 四个真实踩过的坑
 
 这些不是理论提醒,是我在做这次分析时**实际踩到并纠正**的。
 
@@ -734,7 +836,58 @@ K= 8192  242.9 us   K=12288  361.4 us   K=14336  386.7 us   K=16384  452.3 us
 
 **教训:wall-clock 异常时,先用 GPU 侧计数器交叉验证再下结论。** 我差点把这个"发现"当成 kernel 的问题报出去。
 
-### 坑 2:配置文件里有个不存在的计数器
+### 坑 2:512B stride 的 tag 冲突 —— 以及"符合条件≠真踩坑"
+
+这是个**广为流传、确实存在、但极易误判**的坑,值得完整讲一遍。
+
+**官方结论**([MI300X workload tuning guide](https://rocm.docs.amd.com/en/latest/how-to/tuning-guides/mi300x/workload.html)):
+
+> 当矩阵的行 stride 是 **512 字节的倍数**时,会造成 Tagram 通道热点,
+> *"causing a significant performance drop, especially for TN transpose cases…
+> **increase the latency of VMEM instructions**."*
+>
+> **修法**:padding 让 stride 不是 512B 的倍数。例如 `K % 256 == 0` 时用 `lda = ldb = K + 128`。
+
+原理:tag 查询要按地址的某几位选 tag bank(gfx950 有 4 个)。如果地址的这几位被 stride 固定住,所有访问挤向同一个 bank,**其余 bank 闲着**。
+
+**但注意官方措辞是 "increase the latency"** —— 它首先影响的是 `vmcnt` 那条路。只有冲突严重到 TCP 反压 TA 时,才会传导成**发射**停顿。
+
+**我们的 kernel 完全符合触发条件,实测却没踩坑。**
+
+K=1024 时,A 的行 stride = `K/2` = **512 B,正好是 512 的倍数**。按传闻应该中招。实测:
+
+| 计数器 | 实测 | 判据 |
+|---|---|---|
+| `TCP_READ_TAGCONFLICT_STALL_CYCLES` | **0** | ≥10% |
+| `TCP_WRITE_TAGCONFLICT_STALL_CYCLES` | **0** | ≥10% |
+| `TCP_ATOMIC_TAGCONFLICT_STALL_CYCLES` | **0** | ≥10% |
+
+再看 4 个 tag bank 的请求分布(gfx950 独有的 `TCP_TAGRAM{0..3}_REQ`):
+
+```
+TAGRAM0  28.3%      TAGRAM1  21.7%
+TAGRAM2  28.3%      TAGRAM3  21.7%        最大/最小 = 1.31×
+```
+
+**略有不均,但远不到热点级别**(真热点会看到某个 bank 占 70%+)。
+
+**为什么没触发?**(以下是我的推断,AMD 文档没有明说)
+
+- 官方案例针对 **TN transpose**:两个矩阵都按列访问,同一条指令的 64 个 lane 地址跨度极大,每个 lane 打到不同的 tag set
+- 我们的 G2S 是 **8 个 lane 覆盖连续 128B**(见 §1.5),**同一条指令内部高度局部化**,tag 集中在少数几个 set 里
+- B 矩阵还是 preshuffled 的,布局已被重排
+
+**这个坑真正的教训不是"避开 512B",而是:**
+
+> **表面条件符合 ≠ 真的踩坑。** 决定是否冲突的是**实际的 lane→地址映射**,
+> 不是 stride 这一个数字。同样 512B stride,列访问会炸,行访问可能完全没事。
+>
+> **先测 `TCP_*_TAGCONFLICT_STALL_CYCLES` 和 `TCP_TAGRAM{0..3}_REQ`,再决定要不要 padding。**
+> 盲目 padding 的代价是实打实的:显存变大、可能破坏对齐、影响其他访问的合并度。
+
+⚠️ `TCP_TAGRAM{0..3}_REQ` 只有 gfx950 有。MI300 上只能靠 `TAGCONFLICT_STALL` 那三个判断。
+
+### 坑 3:配置文件里有个不存在的计数器
 
 `rocprofiler-compute` 的 gfx950 配置 `3000_mem_bw.yaml` 里引用了 `TA_ADDRESSER_STALLED_CYCLES`(出现 3 次),但 SDK 的计数器定义表里**根本没有这个计数器**:
 
@@ -746,7 +899,7 @@ grep -c "TA_ADDRESSER_STALLED_CYCLES" \
 
 相关指标在真机上出不来值。看到空值别慌,也别浪费时间调。
 
-### 坑 3:EA 读 credit 计数器在 MI350 上不可靠
+### 坑 4:EA 读 credit 计数器在 MI350 上不可靠
 
 如果你顺着往下游查到了 HBM 带宽,注意这条:AMD 自己在 [rocm-systems#4237](https://github.com/ROCm/rocm-systems/pull/4237) 的验证里说明,MI350 上即使读带宽跑到 ~6 TB/s,`TCC_EA0_RDREQ_DRAM_CREDIT_STALL` 仍然 **< 1%**。
 
@@ -797,6 +950,9 @@ grep -c "TA_ADDRESSER_STALLED_CYCLES" \
 | L1→L2 反压 | `100 × TCP_TCR_TCP_STALL_CYCLES / TCP_GATE_EN1` | ≥10% |
 | TLB 容量不够 | `100 × TCP_UTCL1_STALL_INFLIGHT_MAX / TCP_GATE_EN2` | ≥10% |
 | 页表遍历慢 | `100 × TCP_UTCL1_STALL_LFIFO_NO_RES / TCP_GATE_EN2` | ≥10% |
+| tag 冲突 | `100 × TCP_READ_TAGCONFLICT_STALL_CYCLES / TCP_GATE_EN1` | ≥10% |
+| tag bank 热点 | `TCP_TAGRAM{0..3}_REQ` 四者是否均衡 | 某 bank ≫ 25% |
+| **tag 访问浪费倍数** | `实际 tag 访问 / ceil(实际搬运字节 / 64)` | **>1.0 可优化** |
 
 > `GRBM_PER_XCD = rocprofv3 报的 GRBM_GUI_ACTIVE / XCD 数`(MI355X 是 8)。
 > TCP 类指标的分母是 `TCP_GATE_EN1`(TCP 接口时钟),UTCL1 类用 `TCP_GATE_EN2`,**都不是 GRBM**。
@@ -808,12 +964,14 @@ grep -c "TA_ADDRESSER_STALLED_CYCLES" \
 SQ:8   SPI:6   TCP:4   TCC:4   TA:2   TD:2   CPC:2   CPF:2   GRBM:2
 ```
 
-**四条经验:**
+**六条经验:**
 
 1. **发射受限的药方和延迟受限相反。** 前者要减少指令条数,后者要增加 inflight instructions。先分清再动手。
 2. **TA 不是缓存。** 每条 VMEM 指令都必过 TA(`SQ_INSTS_VMEM == TA_TOTAL_WAVEFRONTS`,实测完全相等),命中率再高也不减轻它的负担。这类瓶颈只能靠减少指令数和改善合并度来解。
-3. **看「每有效字节的 TA 代价」,不要看绝对量。** 本文里 G2S 产生了 47% 的 tag 访问,却是全 kernel 写得最好的部分——因为它真的在搬那么多数据。而 store 每条只搬 128B 却要 4 个 tag 访问,每 KB 代价是它的 2 倍。
-4. **模型对不上就别动手。** 建模型(Σ 指令数 × 每条 tag 访问数),和 `TCP_TOTAL_CACHE_ACCESSES` 对比。本文模型精确命中 **2176**,零误差——正是这个匹配才让后面的优化决策站得住。对不上说明你对某条指令的地址模式理解错了。
+3. **算「浪费倍数」,不要看 tag 访问的绝对量。** `实际 tag 访问 / ceil(搬运字节/64)`。本文里 G2S 每条产生 16 个 tag 访问(全 kernel 最多),浪费倍数却是 **1.0——零浪费**;store 每条只有 4 个,浪费倍数 **2.0**。**多不等于差。**
+4. **浪费 1.0 时改 lane 映射没用,要减指令条数。** 两条路径别用错:浪费 >1.0 → 改 swizzle;多条指令挤在同一批 cacheline → 合并成更宽的 load。scale 属于后者。
+5. **模型对不上就别动手。** 建模型(Σ 指令数 × 每条 tag 访问数),和 `TCP_TOTAL_CACHE_ACCESSES` 对比。本文模型精确命中 **2176**,零误差——正是这个匹配才让后面的优化决策站得住。对不上说明你对某条指令的地址模式理解错了。
+6. **传闻的坑要实测验证。** 本文的 kernel 完全符合"512B stride"这个著名踩坑条件,实测 tag 冲突却是 **0**。决定冲突的是实际 lane→地址映射,不是 stride 这一个数字。
 
 ---
 
