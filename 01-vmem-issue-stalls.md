@@ -19,38 +19,115 @@
 
 ---
 
-## 1. 先建立一个结构性直觉
+## 1. VMEM 指令是怎么发射的
 
-在讲计数器之前,你需要知道 CDNA CU 内部的一个**不对称性**。这个不对称是后面所有分析的基础。
+要理解"发射卡住",得先知道一条 `buffer_load` 从指令变成访存请求,中间经过了什么。
+
+### 1.1 调度器:每周期只看一个 SIMD
+
+CU 里的调度器(scheduler)负责给所有在执行的波前发射指令。官方文档([Pipeline descriptions](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/cdna/pipeline-descriptions.html))对它的描述是:
+
+> On every clock cycle, the scheduler:
+> - Considers waves from **one of the SIMD units**, selected in a **round-robin** fashion
+> - Issues up to **one instruction per wavefront** on the selected SIMD
+> - Issues up to **one instruction per each instruction category** among the waves on the selected SIMD:
+>   VALU / **VMEM** / SALU·SMEM / LDS / Branch
+
+三个关键点:
+
+1. **每周期只服务一个 SIMD**,四个 SIMD 轮转。所以对某个 SIMD 上的波前来说,**平均每 4 个周期才轮到一次发射机会**。
+2. 被选中的 SIMD 上,**每个类别最多发 1 条**。VALU 和 VMEM 属于不同类别,所以一条 MFMA 和一条 `buffer_load` **可以同一周期一起发出去**——它们不抢发射槽。
+3. 五个类别加起来,峰值 **IPC = 5**(per-SIMD per-CU)。
+
+> **这里修正一下常见的误解(也是我自己一开始的说法):**
+> 不是"VALU 每周期 4 条、VMEM 每周期 1 条"这种带宽比。
+> 真实机制是**每个 SIMD 每轮到一次、每类别各发 1 条**。
+> VMEM 发不出去,不是因为被 VALU 抢了槽位,而是因为**下游 TA 的队列满了**。
+
+### 1.2 发射之后:SQ → TA 的三个 FIFO
+
+指令发射出去,并不等于访存开始。它先进入 **SQ 到 TA 之间的队列**:
 
 ```
-                    ┌─────────── 一个 CU ───────────┐
-                    │                                │
-     SIMD0  SIMD1  SIMD2  SIMD3      ← VALU:每个 SIMD 一个,共 4 个
-       │      │      │      │
-       └──────┴───┬──┴──────┘
-                  │
-                 TA                  ← 地址生成:整个 CU 只有 1 个
-                  │
-              TCP (vL1D)             ← L1 向量缓存:整个 CU 只有 1 个
-                  │
-                 TD                  ← 数据返回:整个 CU 只有 1 个
+                    ┌──────────── 一个 CU ────────────┐
+   SIMD0  SIMD1  SIMD2  SIMD3    ← 各有独立的指令缓冲(每 SIMD 8 个 wave slot)
+     └──────┴──┬───┴──────┘
+               │  scheduler:round-robin 选 SIMD,每类别发 1 条
+               ▼
+        ┌─── SQ→TA FIFO ───┐     ← ★ 卡就卡在这里
+        │  CMD  / ADDR  / DATA │     三个队列各自会满
+        └──────────┬──────────┘
+                   ▼
+                  TA             ← 地址生成:整个 CU 只有 1 个
+                   │
+               TCP (vL1D)        ← L1 向量缓存:整个 CU 只有 1 个
+                   │
+                  TD             ← 数据返回:整个 CU 只有 1 个
 ```
 
-**向量运算的发射带宽是每周期 4 条,访存指令是每周期 1 条,而且四个 SIMD 要抢。**
+三个 FIFO 分别装:指令本身(CMD)、64 个 lane 的地址(ADDR)、store 的写数据(DATA)。
 
-推论:只要指令流里访存指令占比超过约 1/4,你在**结构上**就必然是 TA 发射受限的——跟带宽、跟缓存命中率、跟 HBM 统统没关系。
+**任何一个满了,SQ 就发不出下一条 VMEM 指令**——哪怕波前完全就绪、哪怕调度器正好轮到它。这就是我们要测的那三个计数器,官方描述是:
 
-更关键的是 TA 处理一条指令的**耗时不是常数**,取决于这条指令要拆成多少个 cacheline 请求:
+> `SQ_VMEM_TA_CMD_FIFO_FULL` — *"Number of cycles texture requests are stalled due to full cmd fifo in TA."*
 
-| 访问模式 | 一条指令产生的 TCP 访问 | TA 占用 |
-|---|---|---|
-| 64 lane 完美合并读 128B | 4 | ~4 周期 |
-| 64 lane 各读 4 字节(分散) | 64 | ~64 周期 |
+注意用词是 **stalled**,不是 waiting——这是**结构冒险**,不是数据依赖。`s_waitcnt vmcnt` 一点关系都没有。
 
-**同样一条指令,代价能差 16 倍。** 在这几十个周期里,后面所有想发访存指令的波前全部堵住。
+### 1.3 关键:TA 排空的速度远慢于发射速度
 
-这就是为什么"指令条数"和"每条指令的合并度"是发射受限分析的两个核心变量。
+TA 拿到一条指令后要做**地址合并(coalescing)**:把 64 个 lane 的地址归并成 cacheline 请求,再逐个发给 TCP。
+
+这一步的耗时**不是常数**,取决于归并出多少个请求:
+
+| 访问模式 | 产生的 cacheline 请求 |
+|---|---|
+| 64 lane 完美合并 | 4 |
+| 64 lane 各读 4 字节、分散在不同 line | 64 |
+
+于是就有了这个**根本失配**:
+
+```
+发射侧:轮到该 SIMD 时,1 周期就能塞 1 条进 FIFO
+TA 侧 :排空 1 条要 4 ~ 64 周期
+```
+
+实测我们这个 kernel(下一节详述):
+
+```
+TA_TA_BUSY / (GRBM_PER_XCD × cu_per_gpu) = 47.7%
+每 CU 的 VMEM 指令数 = 16,384
+=> TA 平均每条指令占用 ≈ 12.9 个周期
+```
+
+**发射侧 1 周期一条,TA 侧 12.9 周期一条——13 倍的失配。** FIFO 被填满是必然的,只是时间问题。
+
+### 1.4 所以 TA 的代价模型是什么
+
+一个容易误解的点:**TA 不是缓存,没有任何复用机制。**
+
+```
+SQ_INSTS_VMEM       = 4,194,304
+TA_TOTAL_WAVEFRONTS = 4,194,304    ← 完全相等
+```
+
+**每一条 VMEM 指令都要过 TA 一次,无一例外。** 第 1000 次访问同一个 cacheline,照样要重新算地址——因为命中判断是 **TCP 的事,发生在 TA 之后**:
+
+```
+SQ 发射 → TA 算地址(每条必过)→ TCP 查 tag(这里才有命中/未命中)→ ...
+```
+
+**推论:缓存命中率再高,也一点都不减轻 TA 的负担。** 这类瓶颈只能靠减少指令条数、改善合并度来解;调局部性、加缓存统统无效。
+
+那"合并"到底在合并什么?**只在一条指令的 64 个 lane 之间比对**,跨指令没有任何记忆。上一条指令刚访问过的 cacheline,下一条指令再访问,TA 完全不知道。
+
+所以:
+
+```
+TA 总开销 ≈ Σ (每条指令归并出的 cacheline 请求数)
+             ↑ 对所有 VMEM 指令求和,一条都跑不掉
+```
+
+**两个可优化的变量就是这个求和式的两项:指令条数,和每条的合并度。** 后面整篇都在围绕这两个数做文章。
 
 ---
 
@@ -87,7 +164,7 @@ TA 被下游反压 = TA_ADDR_STALLED_BY_TC_CYCLES / (GRBM_GUI_ACTIVE × cu_per_g
 |---|---|---|---|
 | 高 | **低** | TA 活太多 | **指令条数 / 合并度** |
 | 高 | 高 | TA 被 L1/L2/HBM 堵 | 下游 TCP → TCC → EA |
-| 低 | 低 | 不是发射问题 | 看 `vmcnt`、I-cache、MFMA 抢发射槽 |
+| 低 | 低 | 不是发射问题 | 看 `vmcnt` 延迟、I-cache 缺失、波前数不足 |
 
 ---
 
@@ -127,11 +204,30 @@ rocprofv3 --pmc SQ_VMEM_TA_CMD_FIFO_FULL SQ_VMEM_TA_ADDR_FIFO_FULL \
 ```
 命令 FIFO 满  = 3,483,262 / 12,802,567 = 27.2%    ← 阈值 10%,超了 2.7 倍
 地址 FIFO 满  = 2,895,311 / 12,802,567 = 22.6%
-TA 忙碌率     = 54,027,298 / (3,540,485 × 32) = 47.7%
-TA 被下游堵   =  1,010,418 / (3,540,485 × 32) =  0.9%    ← 几乎为零
+TA 忙碌率     = 54,027,298 / (442,561 × 256)  = 47.7%
+TA 被下游堵   =  1,010,418 / (442,561 × 256)  =  0.9%    ← 几乎为零
 ```
 
+> ⚠️ **分母有坑,这里花一分钟说清楚。**
+>
+> `rocprofv3` 报的 `GRBM_GUI_ACTIVE = 3,540,485` 是 **8 个 XCD 求和后**的值。
+> 而官方公式(`analysis_configs/gfx950/*.yaml`)用的是 `$GRBM_GUI_ACTIVE_PER_XCD × $cu_per_gpu`,
+> 即 **单 XCD 周期数 × 全卡 CU 数** = `(3,540,485 / 8) × 256` = `442,561 × 256`。
+>
+> 自检方法:`442,561 周期 ÷ 2.4 GHz ≈ 184 µs`,和实测 kernel 时长 235 µs 同量级 ✓
+> 如果你误用了求和值 3,540,485 当作单 XCD 周期,会得到 ~24 µs 这种明显不合理的数。
+
 **结论落在表格第一行:发射受限,且 TA 没有被下游反压。**
+
+顺带把 §1.3 那个失配数算实:
+
+```
+TA busy cycles/CU = 47.7% × 442,561 = 211,101
+每 CU 的 VMEM 指令 = 4,194,304 / 256 = 16,384
+=> TA 每条指令占用 = 211,101 / 16,384 = 12.9 周期
+```
+
+**发射侧 1 周期能塞一条,TA 侧 12.9 周期才排空一条。** FIFO 必然被填满。
 
 这个 0.9% 非常重要——它意味着**继续往 TCC、HBM、Infinity Fabric 查是浪费时间**。很多人的直觉是"访存慢 → 查 L2 命中率 → 查带宽",在这个 kernel 上会一无所获。瓶颈在 CU 内部的地址生成前端。
 
@@ -228,6 +324,19 @@ def load_step(self, kstep, base_tile):
 
 修复方向也很直接:相邻 K-step 的 scale 在内存里是连续的(offset 里 `kstep * 64` 是线性项),所以可以**一次取多个 K-step 的 scale**。取 4 个 K-step 就是 `dwordx4`,指令数直接降到 1/4。
 
+**为什么这样确实有效——用 §1.4 的代价模型解释:**
+
+TA 开销 ≈ Σ(每条指令的 cacheline 请求数)。合并指令并不总能降低这个求和值:如果 4 条指令访问的是**不同**的 cacheline,合并后单条指令的请求数会上升,总和不变,只省下指令条数的固定开销。
+
+但 scale 这个场景是**净赚**的,因为这些 scale 本来就挤在同一批 cacheline 里:
+
+```
+现在:  8 条指令 × 16 请求 = 128 请求,搬 8 × 256B = 2KB
+合并后:2 条指令 × ~16 请求 =  32 请求,搬同样 2KB
+```
+
+**同一个 cacheline 现在被 8 条指令重复请求了多次。** 合并之后这些重复请求消失——省下的不只是指令条数,是实打实的 cacheline 请求总量。这才是收益的真正来源。
+
 > 本文只做定位,不做优化实现——这是下一篇的内容。
 
 ---
@@ -252,7 +361,7 @@ GEMM 的时间应该是 `固定开销 + 每 K-step 开销 × K-step 数`。测 6
 
 **46 µs 固定开销,在 K=8192 时占总时间的 19%。** 主要来自 epilogue——ISA 里那 256 条 `buffer_store_short`,每次只存一个 bf16。
 
-（这部分本文按你的判断先搁置:store 有成熟的解法——先在 LDS 里做一次 shuffle 换布局,再用 `float4` 宽存,能把 256 条降到 ~16 条。但 hot loop 里的 load 才是主要矛盾。）
+（本文先搁置 store:它有成熟解法——先在 LDS 里做一次 shuffle 换布局,再用 `float4` 宽存,能把 256 条降到 ~16 条。但 hot loop 里的 load 才是主要矛盾,先集中火力。）
 
 扣掉固定开销后,稳态段是 **5600~5900 TFLOPS**。这个数字告诉你 hot loop 本身其实相当健康,天花板主要被固定开销和 scale 加载拉低。
 
@@ -315,7 +424,7 @@ grep -c "TA_ADDRESSER_STALLED_CYCLES" \
 ```
 ① SQ_VMEM_TA_CMD_FIFO_FULL / SQ_BUSY_CYCLES  ≥ 10% ?
    │
-   ├─ 否 → 不是发射问题。查 vmcnt 延迟 / I-cache / MFMA 抢发射槽
+   ├─ 否 → 不是发射问题。查 vmcnt 延迟 / I-cache 缺失 / 波前数不足
    │
    └─ 是 → ② TA_ADDR_STALLED_BY_TC_CYCLES / (GRBM×CU) 高吗?
              │
@@ -331,10 +440,13 @@ grep -c "TA_ADDRESSER_STALLED_CYCLES" \
 | 指标 | 公式 | 判据 |
 |---|---|---|
 | VMEM 发射停顿 | `SQ_VMEM_TA_CMD_FIFO_FULL / SQ_BUSY_CYCLES` | ≥10% |
-| TA 忙碌率 | `TA_TA_BUSY / (GRBM_GUI_ACTIVE × cu_per_gpu)` | — |
-| TA 被反压 | `TA_ADDR_STALLED_BY_TC_CYCLES / (GRBM_GUI_ACTIVE × cu_per_gpu)` | 高=下游堵 |
+| TA 忙碌率 | `TA_TA_BUSY / (GRBM_PER_XCD × cu_per_gpu)` | — |
+| TA 被反压 | `TA_ADDR_STALLED_BY_TC_CYCLES / (GRBM_PER_XCD × cu_per_gpu)` | 高=下游堵 |
 | 合并度 | `100 × 64 × TA_TOTAL_WAVEFRONTS / (4 × TCP_TOTAL_ACCESSES)` | ≤50% |
 | L1→L2 反压 | `100 × TCP_TCR_TCP_STALL_CYCLES / TCP_GATE_EN1` | ≥10% |
+
+> `GRBM_PER_XCD = rocprofv3 报的 GRBM_GUI_ACTIVE / XCD 数`(MI355X 是 8)。
+> TCP 类指标的分母是 `TCP_GATE_EN1`(TCP 接口时钟),**不是 GRBM**。
 
 **block 槽位限制**(一趟能采几个):
 
