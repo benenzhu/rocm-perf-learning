@@ -292,8 +292,12 @@ def emit(out, rows, decoded, mine, dispatches, title, ktrace=None):
     p(f"Samples  : {len(rows):6d}  raw")
     p(f"           {len(decoded):6d}  with decoded instruction text")
     p(f"           {len(decoded) - len(mine):6d}  from OTHER kernels -- EXCLUDED")
-    sampled = sorted({r["Dispatch_Id"] for r in mine}, key=int)
-    p(f"           {len(mine):6d}  from this kernel (dispatch {','.join(sampled)})")
+    sampled = sorted({int(r["Dispatch_Id"]) for r in mine})
+    if len(sampled) > 8:
+        span = f"{len(sampled)} dispatches, {sampled[0]}..{sampled[-1]}"
+    else:
+        span = "dispatch " + ",".join(str(x) for x in sampled)
+    p(f"           {len(mine):6d}  from this kernel ({span})")
     if ktrace:
         p(f"           kernel resolved via --kernel-trace (authoritative)")
     p(f"             -> {len(stalled)} stalled / {len(issued)} issued")

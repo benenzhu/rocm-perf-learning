@@ -141,7 +141,7 @@ rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
 | `ARBITER_WIN_EX_STALL` | **赢了仲裁但执行单元不收** ← 对应发射停顿 |
 | `ARBITER_NOT_WIN` | 没抢到发射槽(wave 之间竞争),**不是**同一回事 |
 
-本文案例:`ARBITER_WIN_EX_STALL` 占 **68.8%**,其中 **83% 是 VMEM 指令**(`buffer_store_short` 53.8% + `buffer_load_dwordx4` 23.2%)——和 PMC 的 27.2% 相互印证。
+本文案例(M=N=K=8192):`ARBITER_WIN_EX_STALL` 占 **66.2%**,`WAITCNT` 仅 8.7%——和 PMC 的 27.2% 发射停顿相互印证。
 
 > ⚠️ **必须过滤两次**:① `Instruction` 字段非空 ② 用 `--kernel-trace` 的对照表只保留本 kernel。
 > **`--kernel-include-regex` 不过滤 PC sampling 数据流**(有源码依据),少一道就会看到假的 "WAITCNT 79%"。
@@ -1110,7 +1110,7 @@ ARBITER_WIN_EX_STALL        9.4%
 └─ 3781 个来自 kernel_gemm_0                          ← 只有这些有效
 ```
 
-漏掉第二道的后果:`ARBITER_WIN_EX_STALL` 显示成 **9.4%** 而非真实的 **68.8%**,`WAITCNT` 显示成 **79%** 而非 **9.5%**——**结论完全反向**。发现线索是报告里出现了 `global_load_*` 的停顿,而我们 kernel 的 ISA 里 `grep -c global_load` 是 **0**。
+漏掉第二道的后果:`ARBITER_WIN_EX_STALL` 会被稀释、`WAITCNT` 被夸大到 **79%**——**结论完全反向**。发现线索是报告里出现了 `global_load_*` 的停顿,而我们 kernel 的 ISA 里 `grep -c global_load` 是 **0**。
 
 > ⚠️ **不要用"我的 kernel 独有的指令"来猜。** 通用 opcode 可能和别的 kernel 重合,
 > 而且会漏掉 dispatch(本例真实有 23 个,靠指令反查只找到 5 个)。
@@ -1120,37 +1120,41 @@ ARBITER_WIN_EX_STALL        9.4%
 
 ### 7.2 过滤后:两种方法指向同一处
 
-kernel 内、未发射样本的真实分布(n=2909):
+kernel 内、未发射样本的真实分布(n=11376):
 
 | 停顿原因 | 占比 | 含义 |
 |---|---|---|
-| **`ARBITER_WIN_EX_STALL`** | **68.8%** | **赢了仲裁,但执行单元不收** ← 发射受限 |
-| `BARRIER_WAIT` | 13.6% | 等 barrier |
-| `WAITCNT` | **9.5%** | 等数据返回 |
-| `ALU_DEPENDENCY` | 7.6% | |
-| `NO_INSTRUCTION_AVAILABLE` | 0.3% | |
+| **`ARBITER_WIN_EX_STALL`** | **66.2%** | **赢了仲裁,但执行单元不收** ← 发射受限 |
+| `ALU_DEPENDENCY` | 18.7% | MFMA 依赖链 |
+| `WAITCNT` | **8.7%** | 等数据返回 |
+| `BARRIER_WAIT` | 3.5% | 等 barrier |
+| `NO_INSTRUCTION_AVAILABLE` | 1.3% | |
 | `ARBITER_NOT_WIN` | 0.2% | 仲裁竞争 |
 
-**发射侧 68.8% vs 延迟侧 9.5%,相差 7.2 倍。** 这个 kernel 已经把 32 条 load 堆在飞行中,延迟掩盖得很好——正如 §1.2.5 的 ISA 所示。
+**发射侧 66.2% vs 延迟侧 8.7%,相差 7.6 倍。** 这个 kernel 已经把 32 条 load 堆在飞行中,延迟掩盖得很好——正如 §1.2.5 的 ISA 所示。
 
 **分清这两个 ARBITER 很关键:**
 
 - **`ARBITER_NOT_WIN`** = 没抢到发射槽(wave 之间竞争)
 - **`ARBITER_WIN_EX_STALL`** = **抢到了却发不出去,因为下游满了** ← 这才对应 `SQ_VMEM_TA_*_FIFO_FULL`
 
-再看 `ARBITER_WIN_EX_STALL`(n=2002)落在哪些指令上:
+再看 `ARBITER_WIN_EX_STALL`(n=7536)落在哪些指令上:
 
 | 样本数 | 占比 | 指令 | 对应什么 |
 |---|---|---|---|
-| **1078** | **53.8%** | `buffer_store_short` | epilogue,每 wave 256 条,每 lane 只写 2B |
-| **464** | **23.2%** | `buffer_load_dwordx4` | G2S 主数据,direct-to-LDS,每 wave 64 条 |
-| 223 | 11.1% | `v_mfma_scale_f32_16x16x128` | MFMA |
-| 114 | 5.7% | `buffer_load_dword` | scale 加载,每 wave 32 条 |
-| 40 | 2.0% | `ds_read_b128` | LDS |
+| **4324** | **57.4%** | `v_mfma_scale_f32_16x16x128` | MFMA,每 wave 2048 条 |
+| **1185** | **15.7%** | `buffer_load_dwordx4` | G2S 主数据,direct-to-LDS,每 wave 512 条 |
+| 855 | 11.3% | `buffer_store_short` | epilogue,每 wave 256 条 |
+| 771 | 10.2% | `buffer_load_dword` | scale 加载,每 wave 256 条 |
+| 80 | 1.1% | `ds_read_b128` | LDS |
 
-**VMEM 指令占了 `ARBITER_WIN_EX_STALL` 的 83%。** 这正是 §3.1 那个 27.2% 在指令级的样子——PMC 说"VMEM 发射被 TA 队列堵住",PC Sampling 说"堵的就是这几条 `buffer_*`"。
+**VMEM 合计 37%,MFMA 57%。** 这和 §3.1 那个 27.2% 的 VMEM 发射停顿一致——PMC 说"VMEM 发射被 TA 队列堵住",PC Sampling 指出堵的是哪几条 `buffer_*`。
 
-对照 `ARBITER_NOT_WIN` 只有 **5 个样本(0.2%)**——**wave 之间几乎没有仲裁竞争**,卡的全是"抢到了却发不出去"。
+> MFMA 占比最大是因为**条数最多**(每 wave 2048 条),不是因为它效率低——
+> 它的**停顿率只有 38.3%,是全场最低的**;而 store 的停顿率高达 83.5%。
+> 详见 [00 §4.3](00-pc-sampling-buffer-load-issue-stall.md)。
+
+对照 `ARBITER_NOT_WIN` 只有 **0.2%**——**wave 之间几乎没有仲裁竞争**,卡的全是"抢到了却发不出去"。
 
 **两种独立方法、同一个结论。**
 
@@ -1158,21 +1162,20 @@ kernel 内、未发射样本的真实分布(n=2909):
 
 PC Sampling 补上了 PMC 给不了的信息:**同样是 VMEM 发射停顿,哪条指令占大头。**
 
-```
-buffer_store_short  1078 样本 (53.8%)   ← 最大单一来源
-buffer_load_dwordx4  464 样本 (23.2%)
-buffer_load_dword    114 样本 ( 5.7%)
-```
+这和 §1.5 的浪费倍数模型**互相印证**——注意要看**停顿率**而不是绝对样本数:
 
-这和 §1.5 的浪费倍数模型**互相印证**:
+| | 浪费倍数 | PC 停顿样本 | **每条指令停顿率** | 结论 |
+|---|---|---|---|---|
+| store | **2.0** | 855 | **83.5%** | 单位代价最高 |
+| scale | 1.0 | 771 | 79.4% | 单条最优,靠减条数 |
+| G2S | 1.0 | 1185 | 64.5% | 量大但零浪费 |
+| MFMA | — | 4324 | **38.3%** | 条数多,但单条最健康 |
 
-| | 浪费倍数 | PC 停顿样本 | 结论 |
-|---|---|---|---|
-| store | **2.0** | **1078(最多)** | 两个方法都指向它 |
-| G2S | 1.0 | 464 | 量大但零浪费,不可优化 |
-| scale | 1.0 | 114 | 单条最优,靠减条数 |
+**store 的浪费倍数(2.0)和停顿率(83.5%)都是最高的** —— 两条独立证据一致。
 
-**store 是浪费倍数最高、且实测停顿样本最多的**——两条独立证据都说它该先改。本文前面按"hot loop 优先"把 store 排在后面,**从这个数据看应该提前**。
+> ⚠️ 但这个排序**对 shape 敏感**:store 的条数不随 K 变(固定 256/wave),
+> 而 G2S / scale / MFMA 都随 K 线性增长。K=1024 时 store 占 VMEM 指令的 73%、
+> 是绝对主力;K=8192 时降到 25%。**优化目标要绑定实际 shape。**
 
 ### 7.4 那应该先跑 PC Sampling 吗?
 
@@ -1181,8 +1184,8 @@ buffer_load_dword    114 样本 ( 5.7%)
 | | PMC(第 1 步那趟) | PC Sampling |
 |---|---|---|
 | 耗时 | **6.7 s** | 10.7 s |
-| 统计基础 | 全量计数,**1280 万个周期** | **抽样**,过滤后 2909 个有效停顿样本 |
-| 误差 | 无抽样误差 | 68.8% **± 1.7%**(95% CI,采样越密越准但越慢) |
+| 统计基础 | 全量计数,**1280 万个周期** | **抽样**,过滤后 11376 个有效停顿样本 |
+| 误差 | 无抽样误差 | 66.2% **± 0.8%**(95% CI) |
 | 阈值 | 有官方判据(≥10%) | **无**,只能看相对占比 |
 | 数据可信度 | 直接可用 | **必须先过滤 NO_INST**,否则结论反向 |
 | 定位精度 | 到硬件单元 | **到具体指令** ← 优势 |
@@ -1190,7 +1193,7 @@ buffer_load_dword    114 样本 ( 5.7%)
 三个理由:
 
 1. **PC Sampling 更慢**(本例 10.7s vs 6.7s),"更快"是错觉
-2. **是抽样不是全量**:本例加密采样后有 2909 个有效停顿样本(±1.7%),但默认间隔下只有 309 个(±5.2%)。**要好精度就得跑更久,PMC 没有这个取舍**
+2. **是抽样不是全量**:本例跑 250 次迭代才攒到 11376 个有效停顿样本(±0.8%)。**要好精度就得跑更久,PMC 没有这个取舍**
 3. **没有阈值可依**:PMC 有"≥10% 即认定反压"这样的官方判据;PC Sampling 只有相对占比,**没有基准告诉你多少算高**
 
 **正确的用法是互补:**
@@ -1203,7 +1206,7 @@ PC Sampling 定位置(具体哪条指令)
 两者一致 → 结论可信;不一致 → 有一方的理解错了,继续查
 ```
 
-反过来先跑 PC Sampling 也不是不行,但你会拿着"68.8% ARBITER_WIN_EX_STALL"不知道**这算高还是不算高**——没有基准,而且很容易漏掉 kernel 过滤那一步。
+反过来先跑 PC Sampling 也不是不行,但你会拿着"66.2% ARBITER_WIN_EX_STALL"不知道**这算高还是不算高**——没有基准,而且很容易漏掉 kernel 过滤那一步。
 
 > 📄 **完整报告**:[`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt)
 > 含停顿原因分布、`ARBITER_WIN_EX_STALL` 按指令分解、停顿原因 × 指令矩阵、热点 PC 列表。

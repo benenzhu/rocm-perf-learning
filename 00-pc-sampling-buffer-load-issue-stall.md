@@ -131,9 +131,28 @@ Stall_Reason               ★ 没发出去的话,为什么          ← 全文�
 
 另一个模式 `host_trap` 是软件定时中断,**输出里没有 `Stall_Reason`**,只能告诉你 PC 分布(哪里热)、给不出原因——那正是 §0 里 ATT 已经能做的事。所以本文不用它。
 
-> **采样间隔**:`cycles` 单位下必须是 2 的幂且 ≥65536。
-> 默认 1048576 太稀疏(本例只拿到 309 个有效停顿样本);
-> **用 65536 能拿到 2909 个**,精度从 ±5.2% 提到 ±1.7%。
+### ⚠️ 采样间隔:不要往小了调
+
+`--pc-sampling-interval` 在 `cycles` 单位下必须是 2 的幂且 ≥65536。直觉是"调小 → 样本多 → 更准",**但这个直觉在这里是错的**。
+
+同一个 kernel(K=8192,基线 242 µs)实测三种配置:
+
+| 间隔 | 迭代 | stalled 样本 | 精度 | kernel 中位时长 | **相对基线** |
+|---|---|---|---|---|---|
+| **65536** | 40 | 285 | ±5.5% | **19,576 µs** | **慢 80 倍** ❌ |
+| 262144 | 40 | 8,436 | ±1.0% | 285 µs | 1.18× |
+| **1048576** | **250** | **11,889** | **±0.8%** | **236 µs** | **≈1.0×** ✅ |
+
+**间隔调到 65536 反而只拿到 285 个样本。** 原因是雪崩式的:采样太密 → kernel 被拖慢 80 倍 → 单次 dispatch 长达 130 ms → **采样缓冲区在第一次 dispatch 就写满**,后面 42 次一个样本都没采到。样本全部来自那一次被严重扭曲的执行。
+
+而稀疏采样几乎零开销(236 vs 242 µs,在噪声内),252/253 次 dispatch 全覆盖。
+
+> **正确做法:保持默认的 1048576,靠增加迭代次数补样本量。**
+> 三个间隔的停顿原因分布是一致的(65.5% / 66.6% / 67.4%),
+> **稀疏采样只是样本少,不会引入系统性偏差**——多跑几遍就补回来了。
+
+> 怎么发现自己踩了这个坑:对比 `--kernel-trace` 里的 kernel 时长和你已知的基线。
+> 差一个数量级就说明采样开销已经扭曲了被测对象。
 
 ## 3. 读懂 `Stall_Reason`
 
@@ -156,24 +175,24 @@ Stall_Reason               ★ 没发出去的话,为什么          ← 全文�
 
 ## 4. 本案例的结果
 
-### 4.1 停顿原因分布(n=2909)
+### 4.1 停顿原因分布(n=11376)
 
 ```
-ARBITER_WIN_EX_STALL     2002   68.8%   ################################
-BARRIER_WAIT              396   13.6%   ######
-WAITCNT                   275    9.5%   ####
-ALU_DEPENDENCY            222    7.6%   ####
-NO_INSTRUCTION_AVAILABLE    9    0.3%
-ARBITER_NOT_WIN             5    0.2%
+ARBITER_WIN_EX_STALL     7536   66.2%   ##############################
+ALU_DEPENDENCY           2222   18.7%   #########
+WAITCNT                  1032    8.7%   ####
+BARRIER_WAIT              418    3.5%   ##
+NO_INSTRUCTION_AVAILABLE  156    1.3%   #
+ARBITER_NOT_WIN            43    0.4%
 ```
 
-**发射侧 68.8% vs 延迟侧 9.5%,相差 7.2 倍。**
+**发射侧 66.2% vs 延迟侧 8.7%,相差 7.6 倍。**
 
 三个值得注意的数:
 
-- **`WAITCNT` 只有 9.5%** —— 这个 kernel 已经把 32 条 load 堆在飞行中,延迟掩盖得很好
+- **`WAITCNT` 只有 8.7%** —— 这个 kernel 已经把 32 条 load 堆在飞行中,延迟掩盖得很好
 - **`ARBITER_NOT_WIN` 只有 0.2%** —— wave 之间几乎没有仲裁竞争,卡的全是「抢到了却发不出去」
-- **`NO_INSTRUCTION_AVAILABLE` 只有 0.3%** —— **这回答了 §0.2 那个问题**:
+- **`NO_INSTRUCTION_AVAILABLE` 只有 1.3%** —— **这回答了 §0.2 那个问题**:
   ATT 里那些空白段,在这个 kernel 上**不是 I-cache miss**(取指几乎没有停顿),
   更可能是 ATT 自身的采样局限。同样的方法可以用来验证你自己 kernel 里的空白段。
 
@@ -181,24 +200,40 @@ ARBITER_NOT_WIN             5    0.2%
 
 | 样本数 | 占比 | 指令 | 是什么 |
 |---|---|---|---|
-| **1078** | **53.8%** | `buffer_store_short` | epilogue,每 wave 256 条,每 lane 只写 2B |
-| **464** | **23.2%** | `buffer_load_dwordx4` | G2S 主数据,direct-to-LDS,每 wave 64 条 |
-| 223 | 11.1% | `v_mfma_scale_f32_16x16x128` | MFMA |
-| 114 | 5.7% | `buffer_load_dword` | scale 加载,每 wave 32 条 |
+| **4324** | **57.4%** | `v_mfma_scale_f32_16x16x128` | MFMA,每 wave 2048 条 |
+| **1185** | **15.7%** | `buffer_load_dwordx4` | G2S 主数据,direct-to-LDS,每 wave 512 条 |
+| 855 | 11.3% | `buffer_store_short` | epilogue,每 wave 256 条,每 lane 只写 2B |
+| 771 | 10.2% | `buffer_load_dword` | scale 加载,每 wave 256 条 |
 
-**VMEM 指令占 `ARBITER_WIN_EX_STALL` 的 83%** —— 和 PMC 说的「VMEM 发射被 TA 堵住」完全一致。
+**VMEM 指令合计占 `ARBITER_WIN_EX_STALL` 的 37%,MFMA 占 57%。**
+
+> ⚠️ **这个排序对 K 很敏感,值得单独说明。**
+> epilogue 的 store 数量**不随 K 变化**(固定每 wave 256 条),而 G2S / scale / MFMA 都随 K 线性增长:
+>
+> | | K=1024 | K=8192 |
+> |---|---|---|
+> | G2S | 64 | 512 |
+> | scale | 32 | 256 |
+> | store | **256** | **256**(不变) |
+> | MFMA | 256 | 2048 |
+> | store 占 VMEM 指令 | **73%** | **25%** |
+>
+> 所以 **K 小的时候 store 是主要瓶颈,K 大的时候 MFMA 和 G2S 才是**。
+> 分析结论必须绑定具体 shape——换个 K 优化目标就变了。
 
 ### 4.3 和 PMC 模型互相印证
 
 这是 PC Sampling 最有价值的地方 —— 它给出了 PMC 给不了的**排序**:
 
-| | 浪费倍数([01 §1.5](01-vmem-issue-stalls.md)) | PC 停顿样本 | 结论 |
-|---|---|---|---|
-| store | **2.0** | **1078(最多)** | **两个独立方法都指向它** |
-| G2S | 1.0 | 464 | 量大但零浪费,不可优化 |
-| scale | 1.0 | 114 | 单条最优,只能减条数 |
+| | 浪费倍数([01 §1.5](01-vmem-issue-stalls.md)) | PC 停顿样本 | 每条指令停顿率 | 结论 |
+|---|---|---|---|---|
+| G2S | 1.0 | **1185** | 64.5% | 量大但零浪费 |
+| store | **2.0** | 855 | **83.5%** | 浪费最高、停顿率最高 |
+| scale | 1.0 | 771 | 79.4% | 单条最优,只能减条数 |
 
-**store 既是浪费倍数最高的,也是实测停顿样本最多的。** 两条独立证据交叉验证,优化顺序就很明确了。
+三个 VMEM 来源里,**store 的浪费倍数(2.0)和停顿率(83.5%)都是最高的**——虽然在 K=8192 下它的绝对样本数不是第一,但**单位指令的代价最大**,仍是优先优化目标。
+
+而 MFMA 虽然贡献了 57% 的发射停顿,停顿率只有 **38.3%**(全场最低)——它条数多(每 wave 2048)所以总量大,但**单条指令是健康的**。这正是 §6.1 那张停顿率表的价值:**绝对值会误导,要看比率**。
 
 ---
 
@@ -209,8 +244,8 @@ ARBITER_NOT_WIN             5    0.2%
 | | PMC | PC Sampling |
 |---|---|---|
 | 耗时 | **6.7 s** | 10.7 s |
-| 统计 | 全量,1280 万周期 | 抽样,2909 个有效样本 |
-| 误差 | 无 | ±1.7%(95% CI) |
+| 统计 | 全量,1280 万周期 | 抽样,11376 个有效停顿样本 |
+| 误差 | 无 | ±0.8%(95% CI) |
 | 阈值 | **有**(≥10%) | **无** |
 | 陷阱 | 分母要选对 | 采样时忘了 `--kernel-trace` |
 
@@ -218,7 +253,7 @@ ARBITER_NOT_WIN             5    0.2%
 
 1. **更慢**,"更快"是错觉
 2. **是抽样**:要好精度就得加密采样、跑更久
-3. **没有基准**:拿到「68.8%」你不知道算不算高;PMC 有官方的 ≥10% 判据
+3. **没有基准**:拿到「66.2%」你不知道算不算高;PMC 有官方的 ≥10% 判据
 
 **推荐流程:**
 
@@ -237,7 +272,7 @@ PMC 定方向  →  PC Sampling 定位置  →  两者一致才可信
 ```bash
 # 采集
 rocprof-compute profile -n pcs --experimental --pc-sampling \
-    --pc-sampling-method stochastic --pc-sampling-interval 65536 -- ./your_app
+    --pc-sampling-method stochastic --pc-sampling-interval 1048576 -- ./your_app
 
 # 分析(-k 0 = 只看 Top Stats 里第 0 个 kernel)
 rocprof-compute analyze -p workloads/pcs/MI355 -k 0 \
@@ -316,8 +351,8 @@ rocprof-compute analyze -p workloads/pcs/MI355 -k 0 \
 **两者数据一致**,互为验证:
 
 ```
-官方   : ARBITER_WIN_EX_STALL = 1992/2876 = 69.3%
-rocprofv3: ARBITER_WIN_EX_STALL = 2002/2909 = 68.8%
+官方     : ARBITER_WIN_EX_STALL = 7831/11826 = 66.2%
+rocprofv3: ARBITER_WIN_EX_STALL = 7536/11376 = 66.2%
 ```
 
 **建议:能装 `rocprof-compute` 就用官方**(`-k 0` 省掉一大堆过滤麻烦,还多两个维度),用脚本的 `--from-analyze` 补聚合。环境受限时 `rocprofv3` 直采是等价的备选。
@@ -342,11 +377,11 @@ rocprofv3: ARBITER_WIN_EX_STALL = 2002/2909 = 68.8%
 # 1. 采样。四个 flag 缺一不可:
 #    --pc-sampling-beta-enabled   PC sampling 目前是 beta,不加不生效
 #    --pc-sampling-method stochastic   必须是 stochastic,只有它给 Stall_Reason
-#    --pc-sampling-interval 65536      cycles 单位下必须是 2 的幂且 >= 65536
+#    --pc-sampling-interval 1048576    保持默认!调小会把 kernel 拖慢几十倍(§2)
 #    --kernel-trace                    ★ 否则无法知道样本属于哪个 kernel
 rocprofv3 --pc-sampling-beta-enabled \
           --pc-sampling-method stochastic \
-          --pc-sampling-unit cycles --pc-sampling-interval 65536 \
+          --pc-sampling-unit cycles --pc-sampling-interval 1048576 \
           --kernel-trace \
           --output-format csv -d out -o pc -- ./your_app
 # 产出: out/pc_pc_sampling_stochastic.csv   样本

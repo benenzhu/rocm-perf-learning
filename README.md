@@ -20,15 +20,15 @@
 - [`pc-sampling-official.txt`](pc-sampling-official.txt) — 官方 `rocprof-compute` 路径
 - [`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt) — `rocprofv3` 路径
 
-两条路径的数据互为验证:`ARBITER_WIN_EX_STALL` 分别是 69.3% 和 68.8%。
+两条路径的数据互为验证:`ARBITER_WIN_EX_STALL` 都是 **66.2%**。
 
 ## 这个案例的结论
 
 被测 kernel 是**发射受限**而非延迟受限——指令挤不进访存管线,而不是数据回不来。
-两种方法独立得出同一结论,并且都指向同一个优化目标(epilogue 的 `buffer_store_short`)。
+两种方法独立得出同一结论。优化目标随 shape 变化:K 小时 epilogue 的 `buffer_store_short` 是主要瓶颈,K 大时 MFMA 和 G2S 的绝对量更大——但 store 的单位代价始终最高。
 
 | 方法 | 证据 |
 |---|---|
 | PMC | `SQ_VMEM_TA_CMD_FIFO_FULL / SQ_BUSY_CYCLES` = **27.2%**(阈值 10%),而 `TA_ADDR_STALLED_BY_TC` 仅 0.9% → TA 活太多,不是被下游堵 |
-| PC Sampling | `ARBITER_WIN_EX_STALL` 占 **69%**,其中 84% 是 VMEM 指令;`WAITCNT` 仅 9% |
+| PC Sampling | `ARBITER_WIN_EX_STALL` 占 **66%**,`WAITCNT` 仅 8.7%;停顿率 store 83.5% > scale 79.4% > G2S 64.5% > MFMA 38.3% |
 | tag 访问模型 | store 的浪费倍数 **2.0**(G2S 是 1.0),且占 73% 的指令数 |

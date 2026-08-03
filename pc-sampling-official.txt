@@ -1,28 +1,28 @@
 ====================================================================================================
-PC SAMPLING REPORT  --  fp4_gemm_4wave (kernel_gemm_0) -- MI355X gfx950
+PC SAMPLING REPORT  --  fp4_gemm_4wave (kernel_gemm_0) -- MI355X gfx950, M=N=K=8192
 ====================================================================================================
 Source   : rocprof-compute analyze (section 21. PC Sampling)
 Kernel(s): kernel_gemm_0
-PCs      : 1126 distinct program counters
-Samples  : 3767 total = 891 issued + 2876 stalled
+PCs      : 2087 distinct program counters
+Samples  : 24666 total = 12828 issued + 11838 stalled
 
 NOTE  Percentages below use count_stalled as the denominator.
       Do not sum the stall_reason column directly: it also carries an
-      OTHER_WAIT entry for issued samples (here ~891), which would
+      OTHER_WAIT entry for issued samples (here ~12828), which would
       dilute every real stall reason.
 
 ====================================================================================================
-1. STALL REASONS  (n=2876)
+1. STALL REASONS  (n=11838)
 ====================================================================================================
 
   REASON                        COUNT      PCT
   --------------------------------------------------------------------------------
-  ARBITER_WIN_EX_STALL           1992   69.3%   ################################
-  BARRIER_WAIT                    383   13.3%   ######
-  WAITCNT                         259    9.0%   ####
-  ALU_DEPENDENCY                  227    7.9%   ####
-  NO_INSTRUCTION_AVAILABLE         13    0.5%   
-  INTERNAL_INSTRUCTION              1    0.0%   
+  ARBITER_WIN_EX_STALL           7831   66.2%   ##############################
+  ALU_DEPENDENCY                 2327   19.7%   #########
+  WAITCNT                        1014    8.6%   ####
+  BARRIER_WAIT                    481    4.1%   ##
+  NO_INSTRUCTION_AVAILABLE        141    1.2%   #
+  ARBITER_NOT_WIN                  44    0.4%   
 
   ARBITER_WIN_EX_STALL : won arbitration, execution unit refused it
                          -> downstream (TA / LDS / MFMA) is full. ISSUE STALL.
@@ -38,77 +38,77 @@ NOTE  Percentages below use count_stalled as the denominator.
 
   INSTRUCTION                          COUNT  ISSUED  STALLED   STALL%
   --------------------------------------------------------------------------------
-  buffer_store_short                    1367      77     1290    94.4%
-  buffer_load_dwordx4                    522      35      487    93.3%
-  s_barrier                              385       2      383    99.5%
-  s_waitcnt                              259       0      259   100.0%
-  v_mfma_scale_f32_16x16x128_f8f6f4      522     284      238    45.6%
-  buffer_load_dword                      129      18      111    86.0%
-  ds_read_b128                            86      40       46    53.5%
-  v_accvgpr_read_b32                      86      74       12    14.0%
-  v_add_lshl_u32                          83      71       12    14.5%
-  v_cvt_pk_bf16_f32                       98      91        7     7.1%
-  v_or_b32_e32                            30      24        6    20.0%
-  s_load_dwordx2                           6       2        4    66.7%
-  v_lshlrev_b32_e32                        6       2        4    66.7%
-  v_mul_lo_u32                            11       8        3    27.3%
-  v_lshrrev_b32_e32                        4       1        3    75.0%
-  s_or_b32                                 6       3        3    50.0%
-  v_and_b32_e32                            9       7        2    22.2%
-  s_mul_i32                                8       6        2    25.0%
-  v_accvgpr_mov_b32                       42      40        2     4.8%
-  v_mul_f32_e32                            3       2        1    33.3%
+  v_mfma_scale_f32_16x16x128_f8f6f4    12331    7613     4718    38.3%
+  buffer_load_dwordx4                   2815     998     1817    64.5%
+  buffer_store_short                    1677     276     1401    83.5%
+  s_waitcnt                             1014       0     1014   100.0%
+  ds_read_b128                          2000    1018      982    49.1%
+  buffer_load_dword                     1068     220      848    79.4%
+  s_barrier                              545      64      481    88.3%
+  v_accvgpr_read_b32                     321     236       85    26.5%
+  s_mov_b32                              572     494       78    13.6%
+  s_add_i32                              161      95       66    41.0%
+  v_add_u32_e32                          259     193       66    25.5%
+  v_readfirstlane_b32                    541     483       58    10.7%
+  v_cvt_pk_bf16_f32                      321     271       50    15.6%
+  v_add_lshl_u32                         297     247       50    16.8%
+  s_and_b64                               39      18       21    53.8%
+  v_or_b32_e32                           111      92       19    17.1%
+  s_mul_i32                               23       6       17    73.9%
+  v_lshlrev_b32_e32                       34      17       17    50.0%
+  s_or_b32                                17       3       14    82.4%
+  v_lshl_or_b32                           13       8        5    38.5%
 
 ====================================================================================================
 3. ARBITER_WIN_EX_STALL BY INSTRUCTION  (the issue-stall signal)
 ====================================================================================================
 
-  Total: 1992 samples (69.3% of all stalls)
+  Total: 7831 samples (66.2% of all stalls)
 
      COUNT      PCT   INSTRUCTION
   --------------------------------------------------------------------------------
-      1097    55.1%   buffer_store_short                 #####################
-       469    23.5%   buffer_load_dwordx4                #########
-       236    11.8%   v_mfma_scale_f32_16x16x128_f8f6f4  #####
-       111     5.6%   buffer_load_dword                  ##
-        28     1.4%   ds_read_b128                       #
-        12     0.6%   v_add_lshl_u32                     
-        11     0.6%   v_accvgpr_read_b32                 
-         7     0.4%   v_cvt_pk_bf16_f32                  
-         6     0.3%   v_or_b32_e32                       
-         4     0.2%   v_lshlrev_b32_e32                  
-         3     0.2%   v_mul_lo_u32                       
-         3     0.2%   v_lshrrev_b32_e32                  
-         2     0.1%   v_and_b32_e32                      
-         2     0.1%   v_accvgpr_mov_b32                  
-         1     0.1%   v_mul_f32_e32                      
+      4559    58.2%   v_mfma_scale_f32_16x16x128_f8f6f4  ######################
+      1277    16.3%   buffer_load_dwordx4                ######
+       827    10.6%   buffer_store_short                 ####
+       754     9.6%   buffer_load_dword                  ####
+       105     1.3%   ds_read_b128                       #
+        85     1.1%   v_accvgpr_read_b32                 
+        58     0.7%   v_readfirstlane_b32                
+        50     0.6%   v_cvt_pk_bf16_f32                  
+        47     0.6%   v_add_lshl_u32                     
+        19     0.2%   v_or_b32_e32                       
+        17     0.2%   v_lshlrev_b32_e32                  
+         5     0.1%   v_lshl_or_b32                      
+         5     0.1%   v_mul_lo_u32                       
+         5     0.1%   v_rcp_iflag_f32_e32                
+         5     0.1%   v_and_b32_e32                      
 
-  VMEM (buffer_*/global_*/flat_*): 1677 / 1992 = 84.2%
+  VMEM (buffer_*/global_*/flat_*): 2858 / 7831 = 36.5%
 
 ====================================================================================================
 4. STALL REASON x INSTRUCTION
 ====================================================================================================
 
-  INSTRUCTION                   ARB_WIN_EX       BARRIER       ALU_DEP       WAITCNT NO_INST_AVAIL      INTERNAL         OTHER     TOTAL
+  INSTRUCTION                   ARB_WIN_EX       BARRIER       ALU_DEP       WAITCNT NO_INST_AVAIL   ARB_NOT_WIN         OTHER     TOTAL
   ----------------------------------------------------------------------------------------------------------------------------------------
-  buffer_store_short                  1097             0           185             0             7             0             0      1290
-  buffer_load_dwordx4                  469             0            18             0             0             0             0       487
-  s_barrier                              0           383             0             0             0             0             0       383
-  s_waitcnt                              0             0             0           259             0             0             0       259
-  v_mfma_scale_f32_16x16x128           236             0             1             0             1             0             0       238
-  buffer_load_dword                    111             0             0             0             0             0             0       111
-  ds_read_b128                          28             0            18             0             0             0             0        46
-  v_accvgpr_read_b32                    11             0             0             0             1             0             0        12
-  v_add_lshl_u32                        12             0             0             0             0             0             0        12
-  v_cvt_pk_bf16_f32                      7             0             0             0             0             0             0         7
-  v_or_b32_e32                           6             0             0             0             0             0             0         6
-  s_load_dwordx2                         0             0             0             0             4             0             0         4
-  v_lshlrev_b32_e32                      4             0             0             0             0             0             0         4
-  v_mul_lo_u32                           3             0             0             0             0             0             0         3
-  v_lshrrev_b32_e32                      3             0             0             0             0             0             0         3
-  s_or_b32                               0             0             3             0             0             0             0         3
-  v_and_b32_e32                          2             0             0             0             0             0             0         2
-  s_mul_i32                              0             0             2             0             0             0             0         2
+  v_mfma_scale_f32_16x16x128          4559             0           159             0             0             0             0      4718
+  buffer_load_dwordx4                 1277             0           502             0             0            38             0      1817
+  buffer_store_short                   827             0           537             0            36             1             0      1401
+  s_waitcnt                              0             0             0          1014             0             0             0      1014
+  ds_read_b128                         105             0           877             0             0             0             0       982
+  buffer_load_dword                    754             0            80             0             9             5             0       848
+  s_barrier                              0           481             0             0             0             0             0       481
+  v_accvgpr_read_b32                    85             0             0             0             0             0             0        85
+  s_mov_b32                              0             0            49             0            29             0             0        78
+  s_add_i32                              0             0            66             0             0             0             0        66
+  v_add_u32_e32                          3             0             0             0            63             0             0        66
+  v_readfirstlane_b32                   58             0             0             0             0             0             0        58
+  v_cvt_pk_bf16_f32                     50             0             0             0             0             0             0        50
+  v_add_lshl_u32                        47             0             0             0             3             0             0        50
+  s_and_b64                              0             0            21             0             0             0             0        21
+  v_or_b32_e32                          19             0             0             0             0             0             0        19
+  s_mul_i32                              0             0            17             0             0             0             0        17
+  v_lshlrev_b32_e32                     17             0             0             0             0             0             0        17
 
 ====================================================================================================
 5. HOTTEST PCs  (top 30 by stalled samples)
@@ -116,36 +116,36 @@ NOTE  Percentages below use count_stalled as the denominator.
 
   STALLED     OFFSET  DOMINANT        INSTRUCTION
   ------------------------------------------------------------------------------------------------
-      144         19  WAITCNT         s_waitcnt vmcnt(0)
-       65         19  BARRIER         s_barrier
-       63         19  BARRIER         s_barrier
-       57         19  BARRIER         s_barrier
-       44         19  BARRIER         s_barrier
-       41         19  BARRIER         s_barrier
-       41         19  WAITCNT         s_waitcnt vmcnt(1) lgkmcnt(7)
-       41         19  BARRIER         s_barrier
-       35         19  ARB_WIN_EX      buffer_load_dword v170, v162, s[4:7], 0 offen
-       31         19  WAITCNT         s_waitcnt vmcnt(16)
-       30         19  ARB_WIN_EX      buffer_load_dwordx4 v113, s[16:19], s23 offen lds
-       29         19  ARB_WIN_EX      buffer_load_dwordx4 v111, s[12:15], s22 offen lds
-       28         19  BARRIER         s_barrier
-       26         19  BARRIER         s_barrier
-       24         19  ARB_WIN_EX      buffer_load_dwordx4 v108, s[12:15], s22 offen lds
-       21         19  ARB_WIN_EX      buffer_load_dwordx4 v109, s[12:15], s47 offen lds
-       20         19  ARB_WIN_EX      buffer_load_dwordx4 v109, s[12:15], s2 offen lds
-       18         19  ARB_WIN_EX      buffer_load_dwordx4 v110, s[12:15], s22 offen lds
-       18         19  BARRIER         s_barrier
-       17         19  ARB_WIN_EX      buffer_load_dwordx4 v114, s[16:19], s23 offen lds
-       16         19  ARB_WIN_EX      buffer_load_dwordx4 v113, s[16:19], s2 offen lds
-       16         19  ARB_WIN_EX      buffer_load_dwordx4 v112, s[16:19], s23 offen lds
-       15         19  ARB_WIN_EX      buffer_load_dwordx4 v115, s[16:19], s23 offen lds
-       15         19  ARB_WIN_EX      buffer_load_dword v174, v163, s[8:11], 0 offen
-       14         19  ARB_WIN_EX      buffer_load_dwordx4 v111, s[12:15], s2 offen lds
-       14         19  ARB_WIN_EX      buffer_store_short v6, v5, s[12:15], 0 offen
-       14         19  ARB_WIN_EX      buffer_store_short v5, v6, s[12:15], 0 offen
-       14         19  ARB_WIN_EX      buffer_load_dword v197, v160, s[4:7], 0 offen offset:512
-       14         19  ARB_WIN_EX      buffer_load_dwordx4 v109, s[12:15], s22 offen lds
-       13         19  ARB_WIN_EX      buffer_store_short v10, v11, s[12:15], 0 offen
+      205          3  BARRIER         s_barrier
+      200          3  ARB_WIN_EX      buffer_load_dword v247, v66, s[4:7], 0 offen offset:256
+      177          3  WAITCNT         s_waitcnt vmcnt(11) lgkmcnt(7)
+      169          3  ARB_WIN_EX      buffer_load_dword v164, v67, s[8:11], 0 offen offset:512
+      151          3  ARB_WIN_EX      buffer_load_dword v166, v66, s[4:7], 0 offen offset:512
+      149          3  ARB_WIN_EX      buffer_load_dword v216, v245, s[8:11], 0 offen offset:256
+      130          3  WAITCNT         s_waitcnt vmcnt(0)
+       84          3  ARB_WIN_EX      buffer_load_dwordx4 v122, s[16:19], s20 offen lds
+       82          3  BARRIER         s_barrier
+       82          3  BARRIER         s_barrier
+       76          3  ARB_WIN_EX      buffer_load_dwordx4 v118, s[12:15], s21 offen lds
+       76          3  WAITCNT         s_waitcnt vmcnt(16)
+       75          3  ARB_WIN_EX      buffer_load_dwordx4 v120, s[12:15], s21 offen lds
+       73          3  ARB_WIN_EX      buffer_load_dwordx4 v121, s[12:15], s21 offen lds
+       72          3  ARB_WIN_EX      buffer_load_dwordx4 v119, s[12:15], s22 offen lds
+       70          3  ARB_WIN_EX      buffer_load_dwordx4 v125, s[16:19], s45 offen lds
+       69          3  ARB_WIN_EX      buffer_load_dwordx4 v121, s[12:15], s22 offen lds
+       67          3  WAITCNT         s_waitcnt vmcnt(13) lgkmcnt(7)
+       66          3  ALU_DEP         s_add_i32 s25, s21, 0xfff7ff80
+       65          3  ARB_WIN_EX      buffer_load_dwordx4 v122, s[16:19], s23 offen lds
+       65          3  ARB_WIN_EX      buffer_load_dwordx4 v119, s[12:15], s21 offen lds
+       65          3  BARRIER         s_barrier
+       63          3  ARB_WIN_EX      buffer_load_dwordx4 v120, s[12:15], s22 offen lds
+       62          3  ALU_DEP         buffer_load_dword v243, v67, s[8:11], 0 offen offset:256
+       60          3  WAITCNT         s_waitcnt vmcnt(12) lgkmcnt(3)
+       59          3  ARB_WIN_EX      buffer_load_dwordx4 v118, s[12:15], s22 offen lds
+       57          3  ARB_WIN_EX      buffer_load_dwordx4 v125, s[16:19], s20 offen lds
+       57          3  NO_INST_AVAIL   v_add_u32_e32 v66, v181, v183
+       55          3  ARB_WIN_EX      buffer_load_dwordx4 v118, s[12:15], s46 offen lds
+       53          3  ARB_WIN_EX      buffer_load_dwordx4 v125, s[16:19], s23 offen lds
 
 ====================================================================================================
 END OF REPORT
