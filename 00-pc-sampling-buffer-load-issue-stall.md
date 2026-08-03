@@ -290,32 +290,25 @@ rocprof-compute analyze -p workloads/pcs/MI355 -k 0 \
 
 **① `-k 0` 内置 kernel 过滤。** 官方 analyze 层直接按 kernel 名过滤,输出自带 `Kernel_Name` 列——**不需要自己 join `--kernel-trace`**。
 
-**② `count_issued` / `count_stalled` 拆分。** 这个很有价值:
+**② `source_line` 列。** 用 `-g` 编译时能把每个 PC 映射回**源码行号**。`rocprofv3` 的 csv 里没有这个。
 
-```
-INSTRUCTION                          COUNT  ISSUED  STALLED   STALL%
-buffer_store_short                    1367      77     1290    94.4%
-buffer_load_dwordx4                    522      35      487    93.3%
-v_mfma_scale_f32_16x16x128_f8f6f4      522     284      238    45.6%
-v_accvgpr_read_b32                      86      74       12    14.0%
-```
-
-**同一条指令被采样时,有多大比例发不出去。** VMEM 指令 86~94%,VALU 只有 14% —— 这是**每条指令的健康度**,PMC(按硬件单元统计)和只看停顿样本的统计都给不了。
-
-另外还有 `source_line` 列,用 `-g` 编译时能映射回源码行号。
+> **停顿率不是官方独有的。** 官方的 `count_issued` / `count_stalled` 拆分很好用,
+> 但 `rocprofv3` 的 csv 里有等价信息——`Wave_Issued_Instruction` 列(0/1)。
+> 本文的脚本两条路径都会输出这张表,数值一致(store 停顿率 83.5% vs 84.6%,
+> 差异来自两次独立采样)。
 
 ### 6.2 官方缺的:全局聚合
 
-官方输出是**每个 PC 一行**(本例 1126 行),是原始素材而非结论。你没法直接看出:
+官方输出是**每个 PC 一行**(本例上千行),是原始素材而非结论。你没法直接看出:
 
-- 「发射受限占 69.3%」—— 要把 1126 行的 `stall_reason` 全拆开累加
-- 「`buffer_store_short` 占 `ARBITER_WIN_EX_STALL` 的 55%」—— 同一 opcode 散落在几百行里
+- 「发射受限占 66.2%」—— 要把所有行的 `stall_reason` 拆开累加
+- 「MFMA 占 `ARBITER_WIN_EX_STALL` 的 58%,但它停顿率最低」—— 同一 opcode 散落在几百行里
 
 而这两个恰恰是**判断方向和选优化目标**的关键。
 
 > ⚠️ **聚合时用 `count_stalled`,别直接累加 `stall_reason` 列。**
-> 该列里混了 `OTHER_WAIT`,数量约等于 issued 总数(本例 892 vs 891)——
-> 它其实是"没停顿"。直接累加会把 `ARBITER_WIN_EX_STALL` 从 **69.3%** 稀释到 **52.9%**。
+> 该列里混了 `OTHER_WAIT`,数量约等于 issued 总数——它其实是"没停顿"。
+> 直接累加会把 `ARBITER_WIN_EX_STALL` 的占比显著稀释。
 
 ### 6.3 工具:两种输入都支持
 
@@ -343,7 +336,7 @@ rocprof-compute analyze -p workloads/pcs/MI355 -k 0 \
 |---|---|---|
 | 依赖 | **零**(ROCm 自带) | 重,见下 |
 | kernel 过滤 | 手动 join `--kernel-trace` | ✅ **`-k 0` 内置** |
-| 停顿率(issued/stalled) | ❌ | ✅ |
+| 停顿率(stalled/sampled) | ✅(脚本从 `Wave_Issued_Instruction` 算) | ✅(原生 `count_stalled`) |
 | `source_line` 映射 | ❌ | ✅(需 `-g`) |
 | Top Stats / System Info | ❌ | ✅ 同一份报告 |
 | 全局聚合 | ✅ | ❌ 需自己算 |
@@ -355,7 +348,7 @@ rocprof-compute analyze -p workloads/pcs/MI355 -k 0 \
 rocprofv3: ARBITER_WIN_EX_STALL = 7536/11376 = 66.2%
 ```
 
-**建议:能装 `rocprof-compute` 就用官方**(`-k 0` 省掉一大堆过滤麻烦,还多两个维度),用脚本的 `--from-analyze` 补聚合。环境受限时 `rocprofv3` 直采是等价的备选。
+**建议:能装 `rocprof-compute` 就用官方**(`-k 0` 省掉过滤麻烦,还多一个源码行映射),用脚本的 `--from-analyze` 补聚合。环境受限时 `rocprofv3` 直采是等价的备选——两者的停顿原因和停顿率都能算出来。
 
 > **实测安装成本**(ROCm 7.2.4 自带的是 3.4.0,没有 PC sampling,需要用仓库里的 3.8.0):
 > 1. **不能 `pip install -e .`** —— `pyproject.toml` 里只有 ruff 配置,没有 `[build-system]`。直接 `python3 src/rocprof-compute` 运行

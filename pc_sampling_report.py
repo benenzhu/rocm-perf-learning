@@ -211,7 +211,7 @@ def emit_from_analyze(out, rows, title):
 
     present = [r for r in ORDER if any(r in x["reasons"] for x in rows)]
     rule()
-    p("4. STALL REASON x INSTRUCTION")
+    p("5. STALL REASON x INSTRUCTION")
     rule()
     p("")
     p(f"  {'INSTRUCTION':<26} " + " ".join(f"{ABBR[r]:>13}" for r in present) + f" {'TOTAL':>9}")
@@ -320,11 +320,30 @@ def emit(out, rows, decoded, mine, dispatches, title, ktrace=None):
     p("  WAITCNT              : waiting on s_waitcnt for data. LATENCY, not issue.")
     p("")
 
+    rate = collections.defaultdict(lambda: [0, 0])
+    for r in mine:
+        a = rate[opcode(r)]
+        a[0] += 1
+        if r["Wave_Issued_Instruction"] == "0":
+            a[1] += 1
+    rule()
+    p("2. STALL RATE PER INSTRUCTION  (stalled / sampled)")
+    rule()
+    p("")
+    p("  How often each opcode fails to issue when sampled. Absolute stall counts")
+    p("  favour whatever executes most; this ratio does not.")
+    p("")
+    p(f"  {'INSTRUCTION':<34} {'SAMPLED':>8} {'STALLED':>8} {'STALL%':>8}")
+    p("  " + "-" * 80)
+    for k, (c, st_) in sorted(rate.items(), key=lambda kv: -kv[1][1])[:20]:
+        p(f"  {k[:34]:<34} {c:8d} {st_:8d} {100*st_/c:7.1f}%")
+    p("")
+
     ex = collections.Counter(o for o in (opcode(r) for r in stalled if reason(r) == "ARBITER_WIN_EX_STALL"))
     if ex:
         te = sum(ex.values())
         rule()
-        p("2. ARBITER_WIN_EX_STALL BY INSTRUCTION  (the issue-stall signal)")
+        p("3. ARBITER_WIN_EX_STALL BY INSTRUCTION  (the issue-stall signal)")
         rule()
         p("")
         p(f"  Total: {te} samples ({100*te/tot:.1f}% of all stalls)")
@@ -340,7 +359,7 @@ def emit(out, rows, decoded, mine, dispatches, title, ktrace=None):
 
     byop = collections.Counter(opcode(r) for r in stalled)
     rule()
-    p("3. ALL STALLED INSTRUCTIONS")
+    p("4. ALL STALLED INSTRUCTIONS")
     rule()
     p("")
     p(f"  {'STALLED':>8} {'PCT':>7}   INSTRUCTION")
@@ -351,7 +370,7 @@ def emit(out, rows, decoded, mine, dispatches, title, ktrace=None):
 
     present = [r for r in ORDER if any(reason(x) == r for x in stalled)]
     rule()
-    p("4. STALL REASON x INSTRUCTION")
+    p("5. STALL REASON x INSTRUCTION")
     rule()
     p("")
     p(f"  {'INSTRUCTION':<26} " + " ".join(f"{ABBR[r]:>13}" for r in present) + f" {'TOTAL':>9}")
@@ -365,7 +384,7 @@ def emit(out, rows, decoded, mine, dispatches, title, ktrace=None):
     p("")
 
     rule()
-    p(f"5. INSTRUCTION TYPE MIX  (all samples, n={len(mine)})")
+    p(f"6. INSTRUCTION TYPE MIX  (all samples, n={len(mine)})")
     rule()
     p("")
     ty = collections.Counter(itype(r) for r in mine)
@@ -381,7 +400,7 @@ def emit(out, rows, decoded, mine, dispatches, title, ktrace=None):
         pc[k][0] += 1
         pc[k][1][reason(r)] += 1
     rule()
-    p("6. HOTTEST PCs  (top 30 by stalled samples)")
+    p("7. HOTTEST PCs  (top 30 by stalled samples)")
     rule()
     p("")
     p(f"  {'STALLED':>7}  {'DOMINANT':<14}  INSTRUCTION")

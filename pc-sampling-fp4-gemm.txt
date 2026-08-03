@@ -28,7 +28,37 @@ Samples  :  23957  raw
   WAITCNT              : waiting on s_waitcnt for data. LATENCY, not issue.
 
 ====================================================================================================
-2. ARBITER_WIN_EX_STALL BY INSTRUCTION  (the issue-stall signal)
+2. STALL RATE PER INSTRUCTION  (stalled / sampled)
+====================================================================================================
+
+  How often each opcode fails to issue when sampled. Absolute stall counts
+  favour whatever executes most; this ratio does not.
+
+  INSTRUCTION                         SAMPLED  STALLED   STALL%
+  --------------------------------------------------------------------------------
+  v_mfma_scale_f32_16x16x128_f8f6f4     11983     4491    37.5%
+  buffer_load_dwordx4                    2705     1689    62.4%
+  buffer_store_short                     1583     1339    84.6%
+  ds_read_b128                           1927      962    49.9%
+  s_waitcnt                               961      961   100.0%
+  buffer_load_dword                      1126      880    78.2%
+  s_barrier                               518      462    89.2%
+  v_accvgpr_read_b32                      333       97    29.1%
+  s_mov_b32                               571       84    14.7%
+  v_readfirstlane_b32                     530       65    12.3%
+  v_add_u32_e32                           264       64    24.2%
+  v_cvt_pk_bf16_f32                       302       60    19.9%
+  s_add_i32                               140       55    39.3%
+  v_add_lshl_u32                          285       52    18.2%
+  s_and_b64                                54       33    61.1%
+  s_or_b32                                 21       14    66.7%
+  v_or_b32_e32                             77       13    16.9%
+  s_load_dwordx2                           20       10    50.0%
+  v_rcp_iflag_f32_e32                      15        9    60.0%
+  s_mul_i32                                15        7    46.7%
+
+====================================================================================================
+3. ARBITER_WIN_EX_STALL BY INSTRUCTION  (the issue-stall signal)
 ====================================================================================================
 
   Total: 7536 samples (66.2% of all stalls)
@@ -54,7 +84,7 @@ Samples  :  23957  raw
   VMEM (buffer_*/global_*/flat_*): 2811 / 7536 = 37.3%
 
 ====================================================================================================
-3. ALL STALLED INSTRUCTIONS
+4. ALL STALLED INSTRUCTIONS
 ====================================================================================================
 
    STALLED     PCT   INSTRUCTION
@@ -91,7 +121,7 @@ Samples  :  23957  raw
          1    0.0%   v_bfe_u32
 
 ====================================================================================================
-4. STALL REASON x INSTRUCTION
+5. STALL REASON x INSTRUCTION
 ====================================================================================================
 
   INSTRUCTION                   ARB_WIN_EX       BARRIER       ALU_DEP       WAITCNT NO_INST_AVAIL   ARB_NOT_WIN      INTERNAL     TOTAL
@@ -116,7 +146,7 @@ Samples  :  23957  raw
   s_load_dwordx2                         0             0             3             0             7             0             0        10
 
 ====================================================================================================
-5. INSTRUCTION TYPE MIX  (all samples, n=23952)
+6. INSTRUCTION TYPE MIX  (all samples, n=23952)
 ====================================================================================================
 
   TYPE                        COUNT      PCT
@@ -132,7 +162,7 @@ Samples  :  23957  raw
   BRANCH_NOT_TAKEN                3     0.0%
 
 ====================================================================================================
-6. HOTTEST PCs  (top 30 by stalled samples)
+7. HOTTEST PCs  (top 30 by stalled samples)
 ====================================================================================================
 
   STALLED  DOMINANT        INSTRUCTION
