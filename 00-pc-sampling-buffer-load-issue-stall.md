@@ -1,8 +1,13 @@
-# 02 · PC Sampling 实战:定位到具体哪条指令在停
+# 00 · ROCm Profiler PC Sampling 笔记:如何定位 buffer_load issue stall
 
-> 平台:AMD Instinct MI355X (gfx950 / CDNA4),ROCm `rocprofv3`
-> 案例:同 [01](01-vmem-issue-stalls.md) —— MXFP4 GEMM kernel
-> 配套工具:[`pc_sampling_report.py`](pc_sampling_report.py) · 输出样例:[`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt)
+> 平台:AMD Instinct MI355X (gfx950 / CDNA4)
+> 工具:`rocprof-compute` / `rocprofv3`(两条路径都讲,§7 对比)
+> 案例:一个真实的 MXFP4 GEMM kernel(M=N=K=8192,~4500 TFLOPS)
+> 配套:[`pc_sampling_report.py`](pc_sampling_report.py) · 报告样例 [`pc-sampling-official.txt`](pc-sampling-official.txt)
+
+**这是本系列的开篇。** 想找 kernel 的性能问题,PC Sampling 通常是最快的第一步——它直接告诉你**哪条指令在停、为什么停**,不需要先猜是哪个硬件单元。
+
+想进一步搞清楚"为什么这条指令会停"、以及硬件层面的量化模型,看 [01 · 用 PMC 定位 VMEM 发射停顿](01-vmem-issue-stalls.md)。
 
 ---
 
@@ -61,7 +66,7 @@ PC Sampling 是**采样器**:周期性抓取每个 wave 的 PC + 状态,告诉�
 | 开销(本例) | 6.7 s | 10.7 s |
 
 **两者互补**:PMC 定方向(哪个单元),PC Sampling 定位置(哪条指令)。
-[01](01-vmem-issue-stalls.md) 用 PMC 得出「VMEM 发射被 TA 堵住」,这篇用 PC Sampling 验证并进一步排序。
+本文用 PC Sampling 定位到具体指令;[01](01-vmem-issue-stalls.md) 用 PMC 从硬件单元的角度独立验证同一结论,两者互为交叉印证。
 
 ---
 
