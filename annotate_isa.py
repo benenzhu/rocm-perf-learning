@@ -188,10 +188,21 @@ def main():
       f" ({100.0*matched/total:.1f}%)" if total else "; no samples")
     if a.dispatch is not None:
         p(f"; restricted to dispatch_id={a.dispatch}")
-    p("; columns:  STALLED/SAMPLED  DOMINANT_REASON")
+    p("; columns:  STALLED/SAMPLED  REASON=COUNT ...  (every reason, not just the top one)")
     p("")
 
     short_want = SHORT.get(a.reason, a.reason) if a.reason else None
+
+    def reasons(e):
+        """All stall reasons for one PC, hottest first. A single instruction
+        routinely stalls for more than one reason across its samples -- an MFMA
+        can be both waiting on an operand and losing the execution unit -- so
+        printing only the dominant one hides up to half the story."""
+        return " ".join(f"{r}={c}" for r, c in e["why"].most_common())
+
+    # Align the margin to the widest real instruction rather than a guessed
+    # constant: op_sel/cbsz/blgp-decorated MFMAs run far past 100 columns.
+    width = max((len(t) for o, t in rows if o is not None), default=80) + 2
 
     def key(off):
         e = per.get(off)
@@ -211,16 +222,13 @@ def main():
         text = {o: t for o, t in rows if o is not None}
         for o in hot:
             e = per[o]
-            dom = e["why"].most_common(1)[0] if e["why"] else ("-", 0)
-            extra = f"  {short_want}={e['why'].get(short_want,0)}" if short_want else ""
-            p(f"  0x{o:06x}  {e['stalled']:5d}/{e['n']:<5d} {dom[0]:<12}{extra}   {text[o].strip()[:96]}")
+            p(f"  0x{o:06x}  {e['stalled']:5d}/{e['n']:<5d} {reasons(e):<40}  {text[o].strip()}")
         out = "\n".join(lines) + "\n"
     else:
         for o, t in rows:
             e = per.get(o) if o is not None else None
             if e and e["stalled"] >= a.min_stalled and (not a.only or a.only in t):
-                dom = e["why"].most_common(1)[0][0] if e["why"] else "-"
-                p(f"{t:<100} ; {e['stalled']:5d}/{e['n']:<5d} {dom}")
+                p(f"{t:<{width}} ; {e['stalled']:5d}/{e['n']:<5d} {reasons(e)}")
             else:
                 p(t)
         out = "\n".join(lines) + "\n"
