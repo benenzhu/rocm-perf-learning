@@ -19,6 +19,9 @@
 
 - [`kernel_gemm_0_K8192.s`](kernel_gemm_0_K8192.s) — 被测 kernel 的最终 ISA(gfx950,K=8192)。
   主循环是第 773 行 `.LBB0_1` 到第 1788 行 `s_cbranch_vccnz`。
+- [`reference/`](reference/) — **aiter 手写 asm f4gemm 的反汇编**,含设计分析。
+  关键点:epilogue 用 `v_permlane16_swap_b32` 在寄存器里做跨 lane 转置,
+  然后 `buffer_store_dwordx4` 宽存——**绕开了 LDS shuffle**。
 
 ## 案例报告([`reports/`](reports/))
 
