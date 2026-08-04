@@ -1,0 +1,206 @@
+====================================================================================================
+PC SAMPLING REPORT  --  FlyDSL fp4_gemm_4wave -- swap_operands + wide dwordx4 epilogue (M=N=K=8192, 4856 TFLOPS)
+====================================================================================================
+Samples  :  21954  raw
+            21917  with decoded instruction text
+                0  from OTHER kernels -- EXCLUDED
+            21917  from this kernel (245 dispatches, 2..254)
+           kernel resolved via --kernel-trace (authoritative)
+             -> 10980 stalled / 10937 issued
+
+====================================================================================================
+1. STALL REASONS  (n=10980)
+====================================================================================================
+
+  REASON                        COUNT      PCT
+  --------------------------------------------------------------------------------
+  ARBITER_WIN_EX_STALL           8476   77.2%   ####################################
+  ALU_DEPENDENCY                 1475   13.4%   ######
+  WAITCNT                         509    4.6%   ##
+  BARRIER_WAIT                    400    3.6%   ##
+  NO_INSTRUCTION_AVAILABLE         82    0.7%   
+  INTERNAL_INSTRUCTION             25    0.2%   
+  ARBITER_NOT_WIN                  13    0.1%   
+
+  ARBITER_WIN_EX_STALL : won arbitration, execution unit refused it
+                         -> downstream (TA / LDS / MFMA) is full. ISSUE STALL.
+  ARBITER_NOT_WIN      : lost arbitration to another wave. Different problem.
+  WAITCNT              : waiting on s_waitcnt for data. LATENCY, not issue.
+
+====================================================================================================
+2. STALL RATE PER INSTRUCTION  (stalled / sampled)
+====================================================================================================
+
+  How often each opcode fails to issue when sampled. Absolute stall counts
+  favour whatever executes most; this ratio does not.
+
+  INSTRUCTION                         SAMPLED  STALLED   STALL%
+  --------------------------------------------------------------------------------
+  v_mfma_scale_f32_16x16x128_f8f6f4     10871     3855    35.5%
+  buffer_load_dwordx4                    4086     3214    78.7%
+  buffer_store_dwordx4                   1734     1701    98.1%
+  ds_read_b128                           1760      906    51.5%
+  s_waitcnt                               509      509   100.0%
+  s_barrier                               442      400    90.5%
+  ds_read2st64_b32                        209      114    54.5%
+  s_addk_i32                               88       47    53.4%
+  s_add_u32                               367       44    12.0%
+  s_nop                                    25       25   100.0%
+  v_add_u32_e32                            88       22    25.0%
+  v_lshlrev_b32_e32                        31       18    58.1%
+  s_mul_i32                                29       17    58.6%
+  s_and_b32                                67       15    22.4%
+  ds_read_b32                              21       13    61.9%
+  v_cmp_lt_u64_e64                         27       12    44.4%
+  v_or_b32_e32                             34       11    32.4%
+  v_or3_b32                                20       10    50.0%
+  v_accvgpr_read_b32                      248        8     3.2%
+  v_and_b32_e32                            20        6    30.0%
+
+====================================================================================================
+3. ARBITER_WIN_EX_STALL BY INSTRUCTION  (the issue-stall signal)
+====================================================================================================
+
+  Total: 8476 samples (77.2% of all stalls)
+
+     COUNT      PCT   INSTRUCTION
+  --------------------------------------------------------------------------------
+      3519    41.5%   v_mfma_scale_f32_16x16x128_f8f6f4  ################
+      3201    37.8%   buffer_load_dwordx4                ##############
+      1645    19.4%   buffer_store_dwordx4               #######
+        20     0.2%   v_add_u32_e32                      
+        18     0.2%   v_lshlrev_b32_e32                  
+        12     0.1%   v_cmp_lt_u64_e64                   
+        10     0.1%   ds_read_b128                       
+        10     0.1%   v_or3_b32                          
+         6     0.1%   v_and_b32_e32                      
+         5     0.1%   ds_read2st64_b32                   
+         5     0.1%   v_readfirstlane_b32                
+         5     0.1%   v_or_b32_e32                       
+         4     0.0%   v_mul_f32_e32                      
+         4     0.0%   v_accvgpr_read_b32                 
+         4     0.0%   v_bfe_u32                          
+
+  VMEM (buffer_*/global_*/flat_*): 4846 / 8476 = 57.2%
+
+====================================================================================================
+4. ALL STALLED INSTRUCTIONS
+====================================================================================================
+
+   STALLED     PCT   INSTRUCTION
+  --------------------------------------------------------------------------------
+      3855   35.1%   v_mfma_scale_f32_16x16x128_f8f6f4
+      3214   29.3%   buffer_load_dwordx4
+      1701   15.5%   buffer_store_dwordx4
+       906    8.3%   ds_read_b128
+       509    4.6%   s_waitcnt
+       400    3.6%   s_barrier
+       114    1.0%   ds_read2st64_b32
+        47    0.4%   s_addk_i32
+        44    0.4%   s_add_u32
+        25    0.2%   s_nop
+        22    0.2%   v_add_u32_e32
+        18    0.2%   v_lshlrev_b32_e32
+        17    0.2%   s_mul_i32
+        15    0.1%   s_and_b32
+        13    0.1%   ds_read_b32
+        12    0.1%   v_cmp_lt_u64_e64
+        11    0.1%   v_or_b32_e32
+        10    0.1%   v_or3_b32
+         8    0.1%   v_accvgpr_read_b32
+         6    0.1%   s_load_dwordx2
+         6    0.1%   v_and_b32_e32
+         5    0.0%   v_readfirstlane_b32
+         4    0.0%   v_mul_f32_e32
+         4    0.0%   v_cvt_pk_bf16_f32
+         4    0.0%   v_bfe_u32
+         3    0.0%   v_rcp_iflag_f32_e32
+         2    0.0%   s_mov_b32
+         2    0.0%   v_lshl_or_b32
+         1    0.0%   v_cvt_u32_f32_e32
+         1    0.0%   v_cvt_f32_u32_e32
+
+====================================================================================================
+5. STALL REASON x INSTRUCTION
+====================================================================================================
+
+  Cells are 'count (pct)', where pct is of TOTAL_CNT -- that instruction's
+  total samples. So it reads as: of everything this opcode did, this share
+  was spent stalled for this reason.
+
+  INSTRUCTION                     ARB_WIN_EX         BARRIER         ALU_DEP         WAITCNT   NO_INST_AVAIL     ARB_NOT_WIN        INTERNAL    TOTAL  TOTAL_CNT
+  ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+  v_mfma_scale_f32_16x16x128     3519(32.4%)               -      335( 3.1%)               -        1( 0.0%)               -               -     3855      10871
+  buffer_load_dwordx4            3201(78.3%)               -        1( 0.0%)               -               -       12( 0.3%)               -     3214       4086
+  buffer_store_dwordx4           1645(94.9%)               -       55( 3.2%)               -               -        1( 0.1%)               -     1701       1734
+  ds_read_b128                     10( 0.6%)               -      896(50.9%)               -               -               -               -      906       1760
+  s_waitcnt                                -               -               -     509(100.0%)               -               -               -      509        509
+  s_barrier                                -      400(90.5%)               -               -               -               -               -      400        442
+  ds_read2st64_b32                  5( 2.4%)               -      109(52.2%)               -               -               -               -      114        209
+  s_addk_i32                               -               -       47(53.4%)               -               -               -               -       47         88
+  s_add_u32                                -               -               -               -       44(12.0%)               -               -       44        367
+  s_nop                                    -               -               -               -               -               -      25(100.0%)       25         25
+  v_add_u32_e32                    20(22.7%)               -               -               -        2( 2.3%)               -               -       22         88
+  v_lshlrev_b32_e32                18(58.1%)               -               -               -               -               -               -       18         31
+  s_mul_i32                                -               -       17(58.6%)               -               -               -               -       17         29
+  s_and_b32                                -               -               -               -       15(22.4%)               -               -       15         67
+  ds_read_b32                              -               -       13(61.9%)               -               -               -               -       13         21
+  v_cmp_lt_u64_e64                 12(44.4%)               -               -               -               -               -               -       12         27
+  v_or_b32_e32                      5(14.7%)               -               -               -        6(17.6%)               -               -       11         34
+  v_or3_b32                        10(50.0%)               -               -               -               -               -               -       10         20
+
+====================================================================================================
+6. INSTRUCTION TYPE MIX  (all samples, n=21917)
+====================================================================================================
+
+  TYPE                        COUNT      PCT
+  ----------------------------------------------
+  MATRIX                      10535    48.1%
+  TEX                          5764    26.3%
+  NO_INST                      2491    11.4%
+  VALU                         1115     5.1%
+  SCALAR                        984     4.5%
+  LDS                           972     4.4%
+  BARRIER                        42     0.2%
+  BRANCH_TAKEN                   14     0.1%
+
+====================================================================================================
+7. HOTTEST PCs  (top 30 by stalled samples)
+====================================================================================================
+
+  STALLED  DOMINANT        INSTRUCTION
+  ------------------------------------------------------------------------------------------------
+      418  ARB_WIN_EX      buffer_store_dwordx4 v[6:9], v0, s[0:3], 0 offen
+      408  ARB_WIN_EX      buffer_store_dwordx4 v[6:9], v5, s[0:3], 0 offen
+      400  BARRIER         s_barrier
+      245  ARB_WIN_EX      buffer_store_dwordx4 v[4:7], v8, s[0:3], 0 offen
+      155  ARB_WIN_EX      buffer_load_dwordx4 v73, s[4:7], s40 offen lds
+      153  ARB_WIN_EX      buffer_store_dwordx4 v[4:7], v3, s[0:3], 0 offen
+      144  ARB_WIN_EX      buffer_store_dwordx4 v[6:9], v11, s[0:3], 0 offen
+      138  ARB_WIN_EX      buffer_load_dwordx4 v74, s[4:7], s40 offen lds
+      134  ARB_WIN_EX      buffer_load_dwordx4 v74, s[4:7], s43 offen lds
+      127  ARB_WIN_EX      buffer_store_dwordx4 v[6:9], v10, s[0:3], 0 offen
+      106  ARB_WIN_EX      buffer_load_dwordx4 v72, s[4:7], s40 offen lds
+      102  ARB_WIN_EX      buffer_load_dwordx4 v71, s[4:7], s37 offen lds
+       96  ARB_WIN_EX      buffer_load_dwordx4 v75, s[8:11], s34 offen lds
+       94  ARB_WIN_EX      buffer_store_dwordx4 v[6:9], v12, s[0:3], 0 offen
+       91  ARB_WIN_EX      buffer_load_dwordx4 v75, s[8:11], s38 offen lds
+       90  ARB_WIN_EX      buffer_load_dwordx4 v74, s[4:7], s37 offen lds
+       88  ARB_WIN_EX      buffer_load_dwordx4 v84, s[12:15], s22 offen lds
+       86  ARB_WIN_EX      buffer_load_dwordx4 v73, s[4:7], s37 offen lds
+       85  ARB_WIN_EX      buffer_load_dwordx4 v71, s[4:7], s43 offen lds
+       83  WAITCNT         s_waitcnt lgkmcnt(5)
+       83  ARB_WIN_EX      buffer_load_dwordx4 v77, s[8:11], s34 offen lds
+       81  ARB_WIN_EX      buffer_load_dwordx4 v71, s[4:7], s40 offen lds
+       75  ARB_WIN_EX      buffer_load_dwordx4 v78, s[8:11], s42 offen lds
+       74  ARB_WIN_EX      buffer_load_dwordx4 v77, s[8:11], s42 offen lds
+       69  ARB_WIN_EX      buffer_load_dwordx4 v78, s[8:11], s39 offen lds
+       69  ARB_WIN_EX      buffer_load_dwordx4 v75, s[8:11], s39 offen lds
+       68  ARB_WIN_EX      buffer_load_dwordx4 v73, s[4:7], s35 offen lds
+       68  ARB_WIN_EX      buffer_load_dwordx4 v73, s[4:7], s43 offen lds
+       67  WAITCNT         s_waitcnt lgkmcnt(7)
+       65  ARB_WIN_EX      buffer_load_dwordx4 v76, s[8:11], s34 offen lds
+
+====================================================================================================
+END OF REPORT
+====================================================================================================
