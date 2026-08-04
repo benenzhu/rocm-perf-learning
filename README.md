@@ -15,6 +15,11 @@
 - [`pc_sampling_report.py`](pc_sampling_report.py) — 把 PC sampling 输出聚合成可读报告。
   支持 `rocprof-compute analyze` 报告(`--from-analyze`)和 `rocprofv3` csv 两种输入。
 
+## 参考材料
+
+- [`kernel_gemm_0_K8192.s`](kernel_gemm_0_K8192.s) — 被测 kernel 的最终 ISA(gfx950,K=8192)。
+  主循环是第 773 行 `.LBB0_1` 到第 1788 行 `s_cbranch_vccnz`。
+
 ## 案例报告
 
 - [`pc-sampling-official.txt`](pc-sampling-official.txt) — 官方 `rocprof-compute` 路径

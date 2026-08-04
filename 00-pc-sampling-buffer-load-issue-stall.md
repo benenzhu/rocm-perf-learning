@@ -249,7 +249,7 @@ ARBITER_NOT_WIN            43    0.4%
 | **主循环 `0x1e00–0x42b0`** | **787** | **26.0** | **64** | 0 |
 | epilogue `0x42b0–` | 1165 | 3.4 | 0 | **256** |
 
-这和 ISA 完全吻合(整个 kernel 只有一个循环,`.LBB0_1` → `s_cbranch_vccnz`),也和源码结构对得上:**load 全在主循环,store 全在 epilogue**。
+这和 ISA 完全吻合——整个 kernel 只有一个循环,[`kernel_gemm_0_K8192.s`](kernel_gemm_0_K8192.s) 里 `.LBB0_1`(**第 773 行**)到 `s_cbranch_vccnz`(**第 1788 行**)。也和源码结构对得上:**load 全在主循环,store 全在 epilogue**。
 
 分段之后再看 load 的停顿:
 
@@ -279,7 +279,7 @@ buffer_load_dwordx4 v122, s[16:19], s20 offen lds
 
 两个修饰符决定了语义:**`offen`** 表示第一个 VGPR 操作数是每 lane 的字节偏移;**`lds`** 表示数据直接进 LDS。所以 `v122` 是**输入**,load 在等**地址算完**——不是在等数据回来(那是 `WAITCNT`)。
 
-再看主循环开头的 ISA:
+再看主循环开头的 ISA([`kernel_gemm_0_K8192.s`](kernel_gemm_0_K8192.s) 第 773 行起):
 
 ```asm
 .LBB0_1:
