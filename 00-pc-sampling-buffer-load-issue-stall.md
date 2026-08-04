@@ -3,7 +3,7 @@
 > 平台:AMD Instinct MI355X (gfx950 / CDNA4)
 > 工具:`rocprof-compute` / `rocprofv3`(两条路径都讲,§6 对比)
 > 案例:一个真实的 MXFP4 GEMM kernel(M=N=K=8192,~4500 TFLOPS)
-> 配套:[`pc_sampling_report.py`](pc_sampling_report.py) · 报告样例 [`pc-sampling-official.txt`](pc-sampling-official.txt)
+> 配套:[`pc_sampling_report.py`](pc_sampling_report.py) · 报告样例 [`pc-sampling-official.txt`](reports/pc-sampling-official.txt)
 
 ---
 
@@ -411,8 +411,8 @@ rocprof-compute analyze -p workloads/pcs/MI355 -k 0 \
 ```
 
 `--from-analyze` 模式额外输出 §6.1 那张**停顿率表**。
-输出样例:[`pc-sampling-official.txt`](pc-sampling-official.txt)(官方数据)·
-[`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt)(rocprofv3 数据)
+输出样例:[`pc-sampling-official.txt`](reports/pc-sampling-official.txt)(官方数据)·
+[`pc-sampling-fp4-gemm.txt`](reports/pc-sampling-fp4-gemm.txt)(rocprofv3 数据)
 
 ### 6.4 两条路怎么选
 
@@ -500,5 +500,5 @@ help 只承诺 counter-collection 和 thread-trace,C++ 侧 `is_targeted_kernel()
 
 - [PC Sampling 官方文档](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/how-to/pc_sampling.html)
 - [01 · 当 vmcnt 不是瓶颈:用 PMC 定位 VMEM 发射停顿](01-vmem-issue-stalls.md)
-- 本案例完整报告:[`pc-sampling-official.txt`](pc-sampling-official.txt)(官方路径)·
-  [`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt)(rocprofv3 路径)
+- 本案例完整报告:[`pc-sampling-official.txt`](reports/pc-sampling-official.txt)(官方路径)·
+  [`pc-sampling-fp4-gemm.txt`](reports/pc-sampling-fp4-gemm.txt)(rocprofv3 路径)

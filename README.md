@@ -20,12 +20,29 @@
 - [`kernel_gemm_0_K8192.s`](kernel_gemm_0_K8192.s) — 被测 kernel 的最终 ISA(gfx950,K=8192)。
   主循环是第 773 行 `.LBB0_1` 到第 1788 行 `s_cbranch_vccnz`。
 
-## 案例报告
+## 案例报告([`reports/`](reports/))
 
-- [`pc-sampling-official.txt`](pc-sampling-official.txt) — 官方 `rocprof-compute` 路径
-- [`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt) — `rocprofv3` 路径
+全部 M=N=K=8192,采集配置相同(`--pc-sampling-interval 1048576` + 250 次迭代),可直接横向对比。
 
-两条路径的数据互为验证:`ARBITER_WIN_EX_STALL` 都是 **66.2%**。
+**同一 kernel、两条采集路径**——数据互为验证,`ARBITER_WIN_EX_STALL` 都是 **66.2%**:
+
+| 报告 | 采集方式 |
+|---|---|
+| [`pc-sampling-official.txt`](reports/pc-sampling-official.txt) | `rocprof-compute profile/analyze` |
+| [`pc-sampling-fp4-gemm.txt`](reports/pc-sampling-fp4-gemm.txt) | `rocprofv3` 直采 |
+
+**三个 kernel 实现的横向对比**:
+
+| 报告 | 实现 | TFLOPS | 发射停顿 | epilogue store |
+|---|---|---|---|---|
+| [`pc-sampling-fp4-gemm.txt`](reports/pc-sampling-fp4-gemm.txt) | FlyDSL `main` | 4247 | 66.2% | `store_short` ×1583,停顿率 84.6% |
+| [`pc-sampling-zty-dev-moe.txt`](reports/pc-sampling-zty-dev-moe.txt) | FlyDSL `zty_dev_moe` | 4392 | 66.1% | `store_short` ×1741,停顿率 84.3% |
+| [`pc-sampling-aiter-asm.txt`](reports/pc-sampling-aiter-asm.txt) | aiter 手写 asm | **4583** | **60.7%** | **`store_dwordx4`** ×1029,停顿率 96.3% |
+
+两个值得注意的点:
+
+- **`zty_dev_moe` 消除了 `buffer_load_dwordx4` 的全部 `ALU_DEP`**(468 → 0),做法是把循环不变的地址计算从 VGPR 迁到 SGPR。但停顿率几乎没变(62.4% → 62.6%)——瓶颈只是从"等地址"转成了"等 TA 队列",**暴露得更清楚而非被消除**。
+- **aiter 的 epilogue 用 `dwordx4` 宽存**,正是本仓库两条独立证据(浪费倍数 2.0 + 停顿率最高)指向的优化。store 采样数少 41%,单条停顿率虽高但那是满负荷工作。
 
 ## 这个案例的结论
 

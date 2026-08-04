@@ -1208,7 +1208,7 @@ PC Sampling 定位置(具体哪条指令)
 
 反过来先跑 PC Sampling 也不是不行,但你会拿着"66.2% ARBITER_WIN_EX_STALL"不知道**这算高还是不算高**——没有基准,而且很容易漏掉 kernel 过滤那一步。
 
-> 📄 **完整报告**:[`pc-sampling-fp4-gemm.txt`](pc-sampling-fp4-gemm.txt)
+> 📄 **完整报告**:[`pc-sampling-fp4-gemm.txt`](reports/pc-sampling-fp4-gemm.txt)
 > 含停顿原因分布、`ARBITER_WIN_EX_STALL` 按指令分解、停顿原因 × 指令矩阵、热点 PC 列表。
 
 ---
